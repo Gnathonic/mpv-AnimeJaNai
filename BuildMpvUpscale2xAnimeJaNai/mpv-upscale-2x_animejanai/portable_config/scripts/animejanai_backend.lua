@@ -87,6 +87,14 @@ local function check_components(backend, rife_configured)
                     'will fail; press Ctrl+E to open AnimeJaNai Manager'
             end
         end
+    elseif backend == 'vulkan' then
+        -- The Vulkan backend has no engine-build step: it just needs its shim
+        -- (libaji_vk) and ncnn next to the dispatcher.
+        if not exists('animejanai/inference/libaji_vk.so') then
+            hints[#hints + 1] =
+                'Vulkan backend (libaji_vk) not installed - press Ctrl+E to open ' ..
+                'AnimeJaNai Manager'
+        end
     end
     if rife_configured then
         local rdir = mp.command_native({'expand-path', '~~/../animejanai/rife'})
@@ -133,13 +141,22 @@ end
 local backend_raw, rife_configured, default_slot = read_conf()
 local backend = (backend_raw or 'TensorRT'):lower()
 local hwdec = 'nvdec'
+local extra = ''
 if backend == 'directml' or backend == 'ncnn' then
     hwdec = 'd3d11va'
     mp.set_property('gpu-api', 'd3d11')
+    extra = ', gpu-api=d3d11'
+elseif backend == 'vulkan' then
+    -- Vendor-neutral ncnn-Vulkan backend (Linux/AMD/Intel). The native filter's
+    -- software path takes host NV12/P010 and runs the model on the GPU, so decode
+    -- stays software (mpv autoconverts to NV12); the Vulkan VO from mpv.conf
+    -- (gpu-api=vulkan,auto) renders the upscaled frames. A zero-copy hwdec=vulkan
+    -- path is a later optimization.
+    hwdec = 'no'
+    extra = ' (software-fed; inference on the GPU)'
 end
 mp.set_property('hwdec', hwdec)
-msg.info(string.format('backend %s -> hwdec=%s%s', backend, hwdec,
-                       hwdec == 'd3d11va' and ', gpu-api=d3d11' or ''))
+msg.info(string.format('backend %s -> hwdec=%s%s', backend, hwdec, extra))
 
 -- The Manager's "Set as Default Profile" stores the chosen slot here. mpv
 -- rebuilds the filter chain from the vf string (which bakes in Balanced, 1002)
