@@ -677,6 +677,24 @@ async Task MainLinux()
         "#!/bin/sh\nDIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nexec \"$DIR/mpv\" --config-dir=\"$DIR/portable_config\" \"$@\"\n");
     SetExec(launcher);
 
+    // 7. the ConfEditor / Manager GUI (published linux-x64 Avalonia binary + its native
+    // libs) at the package root, where Ctrl+E (~~/../AnimeJaNaiManager) launches it and
+    // it reads animejanai/animejanai.conf relative to itself.
+    string confDir = Environment.GetEnvironmentVariable("AJI_CONFEDITOR_DIR") ?? "/tmp/confeditor-linux";
+    if (File.Exists(Path.Combine(confDir, "AnimeJaNaiManager")))
+    {
+        foreach (var f in new[] { "AnimeJaNaiManager", "libHarfBuzzSharp.so", "libSkiaSharp.so" })
+        {
+            var src = Path.Combine(confDir, f);
+            if (File.Exists(src)) File.Copy(src, Path.Combine(installDirectory, f), true);
+        }
+        SetExec(Path.Combine(installDirectory, "AnimeJaNaiManager"));
+    }
+    else
+    {
+        Console.WriteLine($"  (ConfEditor not found at {confDir}; package built without the Manager GUI)");
+    }
+
     File.WriteAllText(Path.Combine(installDirectory, "version.txt"), args[0]);
     Console.WriteLine($"Linux package assembled at {installDirectory}");
 }
