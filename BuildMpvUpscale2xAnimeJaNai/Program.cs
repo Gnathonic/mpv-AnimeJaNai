@@ -9,6 +9,7 @@ using ICSharpCode.SharpZipLib.Core;
 using ICSharpCode.SharpZipLib.Zip;
 using SevenZipExtractor;
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using static Downloader;
@@ -602,6 +603,95 @@ async Task Main()
     }
 }
 
+// Linux assembly: instead of downloading the Windows runtimes (TensorRT, DirectML,
+// mpv.net), bundle the locally-built Vulkan stack — the mpv fork binary, the aji
+// dispatcher + ncnn-Vulkan backend (libaji.so/libaji_vk.so) + ncnn, and the ncnn
+// .param/.bin models — then rewrite the managed configs for backend=vulkan. The
+// artifact source dirs are env-overridable (defaults are the dev build trees);
+// once the engine + mpv fork publish Linux release assets these become downloads.
+async Task MainLinux()
+{
+    Console.WriteLine("Assembling the Linux (Vulkan) package...");
+    string home     = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+    string ajiBuild = Environment.GetEnvironmentVariable("AJI_LINUX_BUILD_DIR") ?? Path.Combine(home, "Projects/animejanai-inference/build");
+    string ncnnDir  = Environment.GetEnvironmentVariable("NCNN_LIB_DIR")        ?? "/tmp/ncnn-src/build/src";
+    string mpvBin   = Environment.GetEnvironmentVariable("MPV_FORK_BIN")        ?? "/tmp/mpvfork/build/mpv";
+    string modelsDir= Environment.GetEnvironmentVariable("AJI_MODELS_DIR")      ?? Path.Combine(home, "Projects/animejanai-linux/dist/models");
+
+    if (Directory.Exists(installDirectory)) Directory.Delete(installDirectory, true);
+    Directory.CreateDirectory(installDirectory);
+
+    // 1. engine libs -> animejanai/inference/ (dispatcher loads libaji_vk.so from its own dir)
+    var inference = Path.Combine(installDirectory, "animejanai", "inference");
+    Directory.CreateDirectory(inference);
+    foreach (var so in new[] { "libaji.so", "libaji_vk.so" })
+        File.Copy(Path.Combine(ajiBuild, so), Path.Combine(inference, so), true);
+    // ncnn: ship the real versioned lib + recreate the SONAME chain (libaji_vk NEEDs libncnn.so.1)
+    var ncnnReal = Directory.GetFiles(ncnnDir, "libncnn.so.1.*").OrderBy(f => f).Last();
+    File.Copy(ncnnReal, Path.Combine(inference, Path.GetFileName(ncnnReal)), true);
+    RecreateSymlink(Path.Combine(inference, "libncnn.so.1"), Path.GetFileName(ncnnReal));
+    RecreateSymlink(Path.Combine(inference, "libncnn.so"),   "libncnn.so.1");
+
+    // 2. mpv fork binary (standalone; libmpv is embedded)
+    var mpvDst = Path.Combine(installDirectory, "mpv");
+    File.Copy(mpvBin, mpvDst, true);
+    SetExec(mpvDst);
+
+    // 3. overlay (portable_config + animejanai/animejanai.conf + benchmarks)
+    InstallAnimeJaNaiCore();
+
+    // 4. ncnn models -> animejanai/onnx/ with the built-in slot names; drop the Windows .onnx
+    var modelDir = Path.Combine(installDirectory, "animejanai", "onnx");
+    Directory.CreateDirectory(modelDir);
+    foreach (var f in Directory.GetFiles(modelDir, "*.onnx")) File.Delete(f);
+    void CopyModel(string srcStem, string dstStem)
+    {
+        foreach (var ext in new[] { ".param", ".bin" })
+            File.Copy(Path.Combine(modelsDir, srcStem + ext), Path.Combine(modelDir, dstStem + ext), true);
+    }
+    CopyModel("2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16",   "2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16");
+    CopyModel("2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16", "2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16");
+    CopyModel("2x_AnimeJaNai_SD_V1beta34_Compact",                            "2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op23_dynamo");
+
+    // 5. Linux conf rewrites (Windows source files untouched; only the assembled copies change)
+    File.WriteAllText(Path.Combine(installDirectory, "animejanai", "animejanai.conf"),
+        "[global]\nconfig_version=3\nbackend=vulkan\nlogging=yes\ndefault_slot=1002\n");
+    var pc  = Path.Combine(installDirectory, "portable_config");
+    var mac = Path.Combine(pc, "mpv-animejanai.conf");
+    File.WriteAllText(mac, File.ReadAllText(mac)
+        .Replace("lib=~~/../animejanai/inference/aji.dll", "lib=~~/../animejanai/inference/libaji.so")
+        .Replace(":trtexec=~~/../animejanai/inference/trtexec.exe", "")
+        .Replace("hwdec=nvdec", "hwdec=no")
+        .Replace("gpu-api=vulkan,auto", "gpu-api=auto"));
+    // Ctrl+E "Launch Manager" -> the Linux ConfEditor binary (forward slashes, no .exe)
+    var inp = Path.Combine(pc, "input-animejanai.conf");
+    File.WriteAllText(inp, File.ReadAllText(inp)
+        .Replace("~~\\..\\AnimeJaNaiManager.exe", "~~/../AnimeJaNaiManager")
+        .Replace("~~/../AnimeJaNaiManager.exe",  "~~/../AnimeJaNaiManager"));
+
+    GenerateInputConf();
+
+    // 6. portable launcher (standalone mpv needs an explicit --config-dir)
+    var launcher = Path.Combine(installDirectory, "run-animejanai");
+    File.WriteAllText(launcher,
+        "#!/bin/sh\nDIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\nexec \"$DIR/mpv\" --config-dir=\"$DIR/portable_config\" \"$@\"\n");
+    SetExec(launcher);
+
+    File.WriteAllText(Path.Combine(installDirectory, "version.txt"), args[0]);
+    Console.WriteLine($"Linux package assembled at {installDirectory}");
+}
+
+void RecreateSymlink(string link, string target)
+{
+    if (File.Exists(link) || Directory.Exists(link)) File.Delete(link);
+    File.CreateSymbolicLink(link, target);
+}
+
+void SetExec(string path) => File.SetUnixFileMode(path,
+    UnixFileMode.UserRead  | UnixFileMode.UserWrite  | UnixFileMode.UserExecute |
+    UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
+    UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+
 // The released package is the slim core: everything hardware-specific
 // (TensorRT runtime, per-GPU kernel packs, RIFE models) ships only as
 // component packs, installed on demand by the AnimeJaNai Manager (the
@@ -746,6 +836,10 @@ async Task<List<string>> EmitComponentPacks()
 if (packsOnlyIndex >= 0)
 {
     await EmitComponentPacks();
+}
+else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+{
+    await MainLinux();
 }
 else
 {
