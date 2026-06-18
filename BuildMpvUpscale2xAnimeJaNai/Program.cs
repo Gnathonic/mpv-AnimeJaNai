@@ -665,19 +665,63 @@ async Task MainLinux()
         .Replace("gpu-api=vulkan,auto", "gpu-api=auto")
         // vulkan-queue-count is a Vulkan-VO option; the upscaling is on ncnn-Vulkan
         // and the VO renders via gpu-next/libplacebo, so comment it out (it errors on
-        // an mpv built without the legacy Vulkan VO).
-        .Replace("vulkan-queue-count=", "#vulkan-queue-count="));
-    // Ctrl+E "Launch Manager" -> the Linux ConfEditor binary (forward slashes, no .exe)
+        // an mpv built without the legacy Vulkan VO). Also turn off mpv's built-in OSC
+        // and OSD bar here (global scope, above the profile sections): stock mpv has no
+        // mpv.net UI, so the bundled uosc (scripts/uosc) draws the control bar instead,
+        // and a live built-in OSC would double up with it.
+        .Replace("vulkan-queue-count=3",
+            "#vulkan-queue-count=3\nosc=no\nosd-bar=no"));
+    // Port the mpv.net menu to stock mpv. mpv.net's `script-message-to mpvnet ...`
+    // commands are dead without mpv.net, so remap the load-bearing ones to uosc (the
+    // bundled UI script, which builds its right-click menu from the #menu: annotations
+    // below) and to native mpv commands. uosc's control bar covers the rest; any
+    // remaining mpvnet command is a harmless no-op (mpv just logs "no client mpvnet").
+    // Order matters: longer patterns first, so a prefix match can't eat a longer line
+    // (e.g. "playlist-add  1" is a prefix of "playlist-add  10").
     var inp = Path.Combine(pc, "input-animejanai.conf");
     File.WriteAllText(inp, File.ReadAllText(inp)
+        // Ctrl+E "Launch Manager" -> the Linux ConfEditor binary (forward slashes, no .exe)
         .Replace("~~\\..\\AnimeJaNaiManager.exe", "~~/../AnimeJaNaiManager")
-        .Replace("~~/../AnimeJaNaiManager.exe",  "~~/../AnimeJaNaiManager"));
+        .Replace("~~/../AnimeJaNaiManager.exe",  "~~/../AnimeJaNaiManager")
+        // right-click menu + command palette -> uosc's menu (built from #menu: items)
+        .Replace("script-message-to mpvnet show-menu",            "script-binding uosc/menu")
+        .Replace("script-message-to mpvnet show-command-palette", "script-binding uosc/menu")
+        // open / playlist / track / chapter selectors -> uosc equivalents (the uosc
+        // audio/subtitle menus also offer "load external ..." at the bottom)
+        .Replace("script-message-to mpvnet open-files append",    "script-binding uosc/open-file")
+        .Replace("script-message-to mpvnet open-files",           "script-binding uosc/open-file")
+        .Replace("script-message-to mpvnet load-audio",           "script-binding uosc/audio")
+        .Replace("script-message-to mpvnet load-sub",             "script-binding uosc/subtitles")
+        .Replace("script-message-to mpvnet show-playlist",        "script-binding uosc/playlist")
+        .Replace("script-message-to mpvnet show-audio-tracks",    "script-binding uosc/audio")
+        .Replace("script-message-to mpvnet show-subtitle-tracks", "script-binding uosc/subtitles")
+        .Replace("script-message-to mpvnet show-chapters",        "script-binding uosc/chapters")
+        // file/media info -> the stats overlay
+        .Replace("script-message-to mpvnet show-media-info osd",  "script-binding stats/display-stats-toggle")
+        .Replace("script-message-to mpvnet show-media-info",      "script-binding stats/display-stats-toggle")
+        .Replace("script-message-to mpvnet show-info",            "script-binding stats/display-stats-toggle")
+        // playback + playlist navigation -> native commands
+        .Replace("script-message-to mpvnet play-pause",           "cycle pause")
+        .Replace("script-message-to mpvnet playlist-add -10",     "playlist-prev")
+        .Replace("script-message-to mpvnet playlist-add  10",     "playlist-next")
+        .Replace("script-message-to mpvnet playlist-add -1",      "playlist-prev")
+        .Replace("script-message-to mpvnet playlist-add  1",      "playlist-next")
+        .Replace("script-message-to mpvnet playlist-first",       "playlist-play-index 0")
+        .Replace("script-message-to mpvnet playlist-last",        "playlist-play-index -1")
+        .Replace("script-message-to mpvnet cycle-audio",          "cycle audio")
+        .Replace("script-message-to mpvnet show-progress",        "show-progress")
+        // external links -> the platform opener
+        .Replace("script-message-to mpvnet shell-execute ",       "run xdg-open "));
     // the auto-updater is Windows-only (no Linux AnimeJaNaiUpdater build); drop its
     // script so it doesn't error a failed subprocess on every launch.
     var updScript = Path.Combine(pc, "scripts", "animejanai_update.lua");
     if (File.Exists(updScript)) File.Delete(updScript);
 
     GenerateInputConf();
+
+    // 5b. uosc: the player UI (control bar + context menu) for stock mpv, which has no
+    // mpv.net interface. Reads the #menu: annotations from the input.conf written above.
+    await InstallUoscLinux(pc);
 
     // 6. portable launcher (standalone mpv needs an explicit --config-dir)
     var launcher = Path.Combine(installDirectory, "run-animejanai");
@@ -717,6 +761,33 @@ void SetExec(string path) => File.SetUnixFileMode(path,
     UnixFileMode.UserRead  | UnixFileMode.UserWrite  | UnixFileMode.UserExecute |
     UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
     UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
+
+// Bundle uosc (github.com/tomasklaen/uosc) into the Linux package's portable_config.
+// Stock mpv has no mpv.net UI; uosc gives the control bar + the context menu (built
+// from input.conf's #menu: items). The release zip lays down scripts/uosc/ (a script
+// directory mpv auto-loads) and the icon fonts at its root, so it extracts straight
+// into portable_config. Sourced from AJI_UOSC_DIR if set (a pre-extracted release, used
+// for offline/local builds), otherwise downloaded from the latest GitHub release.
+async Task InstallUoscLinux(string portableConfig)
+{
+    var fromDir = Environment.GetEnvironmentVariable("AJI_UOSC_DIR");
+    if (fromDir != null && File.Exists(Path.Combine(fromDir, "scripts", "uosc", "main.lua")))
+    {
+        Console.WriteLine($"Bundling uosc from {fromDir}...");
+        CopyDirectory(Path.Combine(fromDir, "scripts", "uosc"),
+                      Path.Combine(portableConfig, "scripts", "uosc"));
+        CopyDirectory(Path.Combine(fromDir, "fonts"), Path.Combine(portableConfig, "fonts"));
+        return;
+    }
+
+    Console.WriteLine("Downloading uosc...");
+    var zip = Path.GetFullPath("uosc.zip");
+    await DownloadFileAsync(
+        "https://github.com/tomasklaen/uosc/releases/latest/download/uosc.zip",
+        zip, (progress) => Console.WriteLine($"Downloading uosc ({progress}%)..."));
+    ExtractZip(zip, portableConfig, _ => { });
+    File.Delete(zip);
+}
 
 // The released package is the slim core: everything hardware-specific
 // (TensorRT runtime, per-GPU kernel packs, RIFE models) ships only as
