@@ -651,7 +651,12 @@ async Task MainLinux()
     }
     CopyModel("2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16",   "2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16");
     CopyModel("2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16", "2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16");
-    CopyModel("2x_AnimeJaNai_SD_V1beta34_Compact",                            "2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op23_dynamo");
+    // op21 (DirectML-compatible) replaced op23 upstream; the engine's SD preset now
+    // names the op21 model, and skip-missing-chains would silently drop SD upscaling
+    // for sub-720p sources if the file name didn't match. The ncnn weights are the same
+    // SD model (the conversion is ONNX-opset-agnostic), so the short-stem file is fine
+    // under the op21 name.
+    CopyModel("2x_AnimeJaNai_SD_V1beta34_Compact",                            "2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo");
 
     // 5. Linux conf rewrites (Windows source files untouched; only the assembled copies change)
     File.WriteAllText(Path.Combine(installDirectory, "animejanai", "animejanai.conf"),
@@ -683,15 +688,17 @@ async Task MainLinux()
         // Ctrl+E "Launch Manager" -> the Linux ConfEditor binary (forward slashes, no .exe)
         .Replace("~~\\..\\AnimeJaNaiManager.exe", "~~/../AnimeJaNaiManager")
         .Replace("~~/../AnimeJaNaiManager.exe",  "~~/../AnimeJaNaiManager")
-        // right-click menu + command palette -> uosc's menu (built from #menu: items)
+        // right-click menu -> uosc's menu (built from #menu: items); command palette
+        // (F1) -> uosc/keybinds (its searchable command list), not a 2nd copy of the menu
         .Replace("script-message-to mpvnet show-menu",            "script-binding uosc/menu")
-        .Replace("script-message-to mpvnet show-command-palette", "script-binding uosc/menu")
-        // open / playlist / track / chapter selectors -> uosc equivalents (the uosc
-        // audio/subtitle menus also offer "load external ..." at the bottom)
+        .Replace("script-message-to mpvnet show-command-palette", "script-binding uosc/keybinds")
+        // open files / external audio+subtitle loaders -> uosc's dedicated bindings
+        // (uosc/load-audio and uosc/load-subtitles open a file browser; the track
+        // SELECTORS below stay uosc/audio + uosc/subtitles)
         .Replace("script-message-to mpvnet open-files append",    "script-binding uosc/open-file")
         .Replace("script-message-to mpvnet open-files",           "script-binding uosc/open-file")
-        .Replace("script-message-to mpvnet load-audio",           "script-binding uosc/audio")
-        .Replace("script-message-to mpvnet load-sub",             "script-binding uosc/subtitles")
+        .Replace("script-message-to mpvnet load-audio",           "script-binding uosc/load-audio")
+        .Replace("script-message-to mpvnet load-sub",             "script-binding uosc/load-subtitles")
         .Replace("script-message-to mpvnet show-playlist",        "script-binding uosc/playlist")
         .Replace("script-message-to mpvnet show-audio-tracks",    "script-binding uosc/audio")
         .Replace("script-message-to mpvnet show-subtitle-tracks", "script-binding uosc/subtitles")
@@ -711,7 +718,20 @@ async Task MainLinux()
         .Replace("script-message-to mpvnet cycle-audio",          "cycle audio")
         .Replace("script-message-to mpvnet show-progress",        "show-progress")
         // external links -> the platform opener
-        .Replace("script-message-to mpvnet shell-execute ",       "run xdg-open "));
+        .Replace("script-message-to mpvnet shell-execute ",       "run xdg-open ")
+        // osc=no killed the built-in OSC, so "Toggle OSC Visibility" -> uosc's UI toggle
+        .Replace("script-binding osc/visibility",                 "script-binding uosc/toggle-ui")
+        // no Linux auto-updater: make "AnimeJaNai > Install Update" a no-op instead of
+        // firing a dead script-message (the animejanai_update.lua script is removed below)
+        .Replace("Ctrl+u           script-message animejanai-update #menu: AnimeJaNai > Install Update",
+                 "#Ctrl+u          script-message animejanai-update (no Linux updater)")
+        // AnimeJaNai upscale slots, mouse-reachable from the menu (the !/@/SHARP/Ctrl+N
+        // keys still switch slots; uosc nests these under AnimeJaNai > Upscale by path)
+        + "\n\n# Linux: expose the upscale slots in the uosc menu (menu-only entries)\n"
+        + "_  apply-profile upscale-on; show-text \"AnimeJaNai: Off\"; script-message aji-slot 0          #menu: AnimeJaNai > Upscale > Off\n"
+        + "_  apply-profile upscale-on; show-text \"AnimeJaNai: Quality\"; script-message aji-slot 1001    #menu: AnimeJaNai > Upscale > Quality\n"
+        + "_  apply-profile upscale-on; show-text \"AnimeJaNai: Balanced\"; script-message aji-slot 1002   #menu: AnimeJaNai > Upscale > Balanced\n"
+        + "_  apply-profile upscale-on; show-text \"AnimeJaNai: Performance\"; script-message aji-slot 1003 #menu: AnimeJaNai > Upscale > Performance\n");
     // the auto-updater is Windows-only (no Linux AnimeJaNaiUpdater build); drop its
     // script so it doesn't error a failed subprocess on every launch.
     var updScript = Path.Combine(pc, "scripts", "animejanai_update.lua");
