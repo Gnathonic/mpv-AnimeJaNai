@@ -662,12 +662,20 @@ async Task MainLinux()
         .Replace("lib=~~/../animejanai/inference/aji.dll", "lib=~~/../animejanai/inference/libaji.so")
         .Replace(":trtexec=~~/../animejanai/inference/trtexec.exe", "")
         .Replace("hwdec=nvdec", "hwdec=no")
-        .Replace("gpu-api=vulkan,auto", "gpu-api=auto"));
+        .Replace("gpu-api=vulkan,auto", "gpu-api=auto")
+        // vulkan-queue-count is a Vulkan-VO option; the upscaling is on ncnn-Vulkan
+        // and the VO renders via gpu-next/libplacebo, so comment it out (it errors on
+        // an mpv built without the legacy Vulkan VO).
+        .Replace("vulkan-queue-count=", "#vulkan-queue-count="));
     // Ctrl+E "Launch Manager" -> the Linux ConfEditor binary (forward slashes, no .exe)
     var inp = Path.Combine(pc, "input-animejanai.conf");
     File.WriteAllText(inp, File.ReadAllText(inp)
         .Replace("~~\\..\\AnimeJaNaiManager.exe", "~~/../AnimeJaNaiManager")
         .Replace("~~/../AnimeJaNaiManager.exe",  "~~/../AnimeJaNaiManager"));
+    // the auto-updater is Windows-only (no Linux AnimeJaNaiUpdater build); drop its
+    // script so it doesn't error a failed subprocess on every launch.
+    var updScript = Path.Combine(pc, "scripts", "animejanai_update.lua");
+    if (File.Exists(updScript)) File.Delete(updScript);
 
     GenerateInputConf();
 
