@@ -87,12 +87,13 @@ local function check_components(backend, rife_configured)
                     'will fail; press Ctrl+E to open AnimeJaNai Manager'
             end
         end
-    elseif backend == 'vulkan' then
-        -- The Vulkan backend has no engine-build step: it just needs its shim
-        -- (libaji_vk) and ncnn next to the dispatcher.
-        if not exists('animejanai/inference/libaji_vk.so') then
+    elseif backend == 'rocm' or backend == 'vulkan' then
+        -- The ROCm/MIGraphX backend needs its shim (libaji_rocm) next to the
+        -- dispatcher and a system ROCm install (MIGraphX/HIP). MIGraphX compiles a
+        -- per-resolution engine on first use (a few seconds), then caches a .mxr.
+        if not exists('animejanai/inference/libaji_rocm.so') then
             hints[#hints + 1] =
-                'Vulkan backend (libaji_vk) not installed - press Ctrl+E to open ' ..
+                'ROCm backend (libaji_rocm) not installed - press Ctrl+E to open ' ..
                 'AnimeJaNai Manager'
         end
     end
@@ -146,14 +147,13 @@ if backend == 'directml' or backend == 'ncnn' then
     hwdec = 'd3d11va'
     mp.set_property('gpu-api', 'd3d11')
     extra = ', gpu-api=d3d11'
-elseif backend == 'vulkan' then
-    -- Vendor-neutral ncnn-Vulkan backend (Linux/AMD/Intel). The native filter's
-    -- software path takes host NV12/P010 and runs the model on the GPU, so decode
-    -- stays software (mpv autoconverts to NV12); the Vulkan VO from mpv.conf
-    -- (gpu-api=vulkan,auto) renders the upscaled frames. A zero-copy hwdec=vulkan
-    -- path is a later optimization.
+elseif backend == 'rocm' or backend == 'vulkan' then
+    -- AMD ROCm/MIGraphX backend (Linux/AMD). The native filter's software path takes
+    -- host NV12/P010, the shim runs the model on the GPU via MIGraphX, so decode stays
+    -- software (mpv autoconverts to NV12); the VO renders via gpu-next/libplacebo. A
+    -- zero-copy hwdec path is a later optimization. ('vulkan' is the retired alias.)
     hwdec = 'no'
-    extra = ' (software-fed; inference on the GPU)'
+    extra = ' (software-fed; MIGraphX inference on the GPU)'
 end
 mp.set_property('hwdec', hwdec)
 msg.info(string.format('backend %s -> hwdec=%s%s', backend, hwdec, extra))

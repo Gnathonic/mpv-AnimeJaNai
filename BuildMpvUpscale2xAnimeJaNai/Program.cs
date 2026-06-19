@@ -611,26 +611,22 @@ async Task Main()
 // once the engine + mpv fork publish Linux release assets these become downloads.
 async Task MainLinux()
 {
-    Console.WriteLine("Assembling the Linux (Vulkan) package...");
+    Console.WriteLine("Assembling the Linux (ROCm/MIGraphX) package...");
     string home     = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
     string ajiBuild = Environment.GetEnvironmentVariable("AJI_LINUX_BUILD_DIR") ?? Path.Combine(home, "Projects/animejanai-inference/build");
-    string ncnnDir  = Environment.GetEnvironmentVariable("NCNN_LIB_DIR")        ?? "/tmp/ncnn-src/build/src";
     string mpvBin   = Environment.GetEnvironmentVariable("MPV_FORK_BIN")        ?? "/tmp/mpvfork/build/mpv";
-    string modelsDir= Environment.GetEnvironmentVariable("AJI_MODELS_DIR")      ?? Path.Combine(home, "Projects/animejanai-linux/dist/models");
 
     if (Directory.Exists(installDirectory)) Directory.Delete(installDirectory, true);
     Directory.CreateDirectory(installDirectory);
 
-    // 1. engine libs -> animejanai/inference/ (dispatcher loads libaji_vk.so from its own dir)
+    // 1. engine libs -> animejanai/inference/ (the dispatcher loads libaji_rocm.so from
+    // its own dir). aji_rocm links MIGraphX + HIP from the SYSTEM ROCm install (rpath
+    // /opt/rocm/lib) — ROCm must be installed; nothing ROCm is bundled (it's gigabytes,
+    // like CUDA for the TensorRT backend).
     var inference = Path.Combine(installDirectory, "animejanai", "inference");
     Directory.CreateDirectory(inference);
-    foreach (var so in new[] { "libaji.so", "libaji_vk.so" })
+    foreach (var so in new[] { "libaji.so", "libaji_rocm.so" })
         File.Copy(Path.Combine(ajiBuild, so), Path.Combine(inference, so), true);
-    // ncnn: ship the real versioned lib + recreate the SONAME chain (libaji_vk NEEDs libncnn.so.1)
-    var ncnnReal = Directory.GetFiles(ncnnDir, "libncnn.so.1.*").OrderBy(f => f).Last();
-    File.Copy(ncnnReal, Path.Combine(inference, Path.GetFileName(ncnnReal)), true);
-    RecreateSymlink(Path.Combine(inference, "libncnn.so.1"), Path.GetFileName(ncnnReal));
-    RecreateSymlink(Path.Combine(inference, "libncnn.so"),   "libncnn.so.1");
 
     // 2. mpv fork binary (standalone; libmpv is embedded)
     var mpvDst = Path.Combine(installDirectory, "mpv");
@@ -640,42 +636,27 @@ async Task MainLinux()
     // 3. overlay (portable_config + animejanai/animejanai.conf + benchmarks)
     InstallAnimeJaNaiCore();
 
-    // 4. ncnn models -> animejanai/onnx/ with the built-in slot names; drop the Windows .onnx
+    // 4. models: aji_rocm runs the .onnx DIRECTLY (the same fp16 SPAN models the TRT/DML
+    // backends ship: 3 standard + 2 sharp + SD op21), already placed by the overlay in
+    // step 3 — no ncnn .param conversion. MIGraphX compiles a per-(model,resolution)
+    // engine to a .mxr next to the .onnx on first use, then caches it.
     var modelDir = Path.Combine(installDirectory, "animejanai", "onnx");
-    Directory.CreateDirectory(modelDir);
-    foreach (var f in Directory.GetFiles(modelDir, "*.onnx")) File.Delete(f);
-    void CopyModel(string srcStem, string dstStem)
-    {
-        foreach (var ext in new[] { ".param", ".bin" })
-            File.Copy(Path.Combine(modelsDir, srcStem + ext), Path.Combine(modelDir, dstStem + ext), true);
-    }
-    CopyModel("2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16",   "2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16");
-    CopyModel("2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16", "2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16");
-    // Sharp variants: the [global] quality/balanced/performance_preset=sharp option
-    // (the Manager's Standard/Sharp toggle) swaps _HD_V3.1_ -> _HD_V3.1Sharp1_ in the
-    // model name. Without these the sharp chains hit a missing model and drop entirely.
-    CopyModel("2x_AnimeJaNai_HD_V3.1Sharp1_Balanced_SPANF3_b8f64_unshuffle_fp16",   "2x_AnimeJaNai_HD_V3.1Sharp1_Balanced_SPANF3_b8f64_unshuffle_fp16");
-    CopyModel("2x_AnimeJaNai_HD_V3.1Sharp1_Performance_SPANF3_b5f48_unshuffle_fp16", "2x_AnimeJaNai_HD_V3.1Sharp1_Performance_SPANF3_b5f48_unshuffle_fp16");
-    // op21 (DirectML-compatible) replaced op23 upstream; the engine's SD preset now
-    // names the op21 model, and skip-missing-chains would silently drop SD upscaling
-    // for sub-720p sources if the file name didn't match. The ncnn weights are the same
-    // SD model (the conversion is ONNX-opset-agnostic), so the short-stem file is fine
-    // under the op21 name.
-    CopyModel("2x_AnimeJaNai_SD_V1beta34_Compact",                            "2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo");
+    int onnxCount = Directory.Exists(modelDir) ? Directory.GetFiles(modelDir, "*.onnx").Length : 0;
+    Console.WriteLine($"  {onnxCount} .onnx models shipped for MIGraphX");
 
     // 5. Linux conf rewrites (Windows source files untouched; only the assembled copies change)
     // Preserve the shipped default conf (the [slot_1..9] "New Profile" placeholders the
-    // Manager edits) for parity; only swap the backend to the Vulkan dispatcher. Built-in
+    // Manager edits) for parity; only swap the backend to the ROCm dispatcher. Built-in
     // slots 1001/1002/1003 (single-model presets) and any custom multi-model chains the
-    // user defines via the Manager both work on aji_vk; default_slot stays 1002.
+    // user defines via the Manager both work on aji_rocm; default_slot stays 1002.
     var ajiConf = Path.Combine(installDirectory, "animejanai", "animejanai.conf");
     if (File.Exists(ajiConf))
         File.WriteAllText(ajiConf, File.ReadAllText(ajiConf)
-            .Replace("backend=TensorRT", "backend=vulkan")
-            .Replace("backend=DirectML", "backend=vulkan"));
+            .Replace("backend=TensorRT", "backend=rocm")
+            .Replace("backend=DirectML", "backend=rocm"));
     else
         File.WriteAllText(ajiConf,
-            "[global]\nconfig_version=3\nbackend=vulkan\nlogging=yes\ndefault_slot=1002\n");
+            "[global]\nconfig_version=3\nbackend=rocm\nlogging=yes\ndefault_slot=1002\n");
     var pc  = Path.Combine(installDirectory, "portable_config");
     var mac = Path.Combine(pc, "mpv-animejanai.conf");
     File.WriteAllText(mac, File.ReadAllText(mac)
