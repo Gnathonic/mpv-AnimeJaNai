@@ -651,6 +651,11 @@ async Task MainLinux()
     }
     CopyModel("2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16",   "2x_AnimeJaNai_HD_V3.1_Balanced_SPANF3_b8f64_unshuffle_fp16");
     CopyModel("2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16", "2x_AnimeJaNai_HD_V3.1_Performance_SPANF3_b5f48_unshuffle_fp16");
+    // Sharp variants: the [global] quality/balanced/performance_preset=sharp option
+    // (the Manager's Standard/Sharp toggle) swaps _HD_V3.1_ -> _HD_V3.1Sharp1_ in the
+    // model name. Without these the sharp chains hit a missing model and drop entirely.
+    CopyModel("2x_AnimeJaNai_HD_V3.1Sharp1_Balanced_SPANF3_b8f64_unshuffle_fp16",   "2x_AnimeJaNai_HD_V3.1Sharp1_Balanced_SPANF3_b8f64_unshuffle_fp16");
+    CopyModel("2x_AnimeJaNai_HD_V3.1Sharp1_Performance_SPANF3_b5f48_unshuffle_fp16", "2x_AnimeJaNai_HD_V3.1Sharp1_Performance_SPANF3_b5f48_unshuffle_fp16");
     // op21 (DirectML-compatible) replaced op23 upstream; the engine's SD preset now
     // names the op21 model, and skip-missing-chains would silently drop SD upscaling
     // for sub-720p sources if the file name didn't match. The ncnn weights are the same
