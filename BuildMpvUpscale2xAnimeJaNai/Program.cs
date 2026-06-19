@@ -659,8 +659,18 @@ async Task MainLinux()
     CopyModel("2x_AnimeJaNai_SD_V1beta34_Compact",                            "2x_AnimeJaNai_SD_V1beta34_Compact_1x3xHxW_dyn-HW_strong_fp16_op21_dynamo");
 
     // 5. Linux conf rewrites (Windows source files untouched; only the assembled copies change)
-    File.WriteAllText(Path.Combine(installDirectory, "animejanai", "animejanai.conf"),
-        "[global]\nconfig_version=3\nbackend=vulkan\nlogging=yes\ndefault_slot=1002\n");
+    // Preserve the shipped default conf (the [slot_1..9] "New Profile" placeholders the
+    // Manager edits) for parity; only swap the backend to the Vulkan dispatcher. Built-in
+    // slots 1001/1002/1003 (single-model presets) and any custom multi-model chains the
+    // user defines via the Manager both work on aji_vk; default_slot stays 1002.
+    var ajiConf = Path.Combine(installDirectory, "animejanai", "animejanai.conf");
+    if (File.Exists(ajiConf))
+        File.WriteAllText(ajiConf, File.ReadAllText(ajiConf)
+            .Replace("backend=TensorRT", "backend=vulkan")
+            .Replace("backend=DirectML", "backend=vulkan"));
+    else
+        File.WriteAllText(ajiConf,
+            "[global]\nconfig_version=3\nbackend=vulkan\nlogging=yes\ndefault_slot=1002\n");
     var pc  = Path.Combine(installDirectory, "portable_config");
     var mac = Path.Combine(pc, "mpv-animejanai.conf");
     File.WriteAllText(mac, File.ReadAllText(mac)
