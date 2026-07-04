@@ -565,12 +565,23 @@ void CopyDirectory(string srcDir, string targetDir)
 
     foreach (string file in Directory.GetFiles(srcDir))
     {
+        // Never ship per-machine/per-GPU runtime cruft: MIGraphX engine caches
+        // (.mxr, gfx-specific) and hipRTC color code objects (.co). Both are
+        // regenerated on first run; this mirrors the engine repo's .gitignore so a
+        // package staged from a directory that was played in stays pristine.
+        var ext = Path.GetExtension(file);
+        if (ext.Equals(".mxr", StringComparison.OrdinalIgnoreCase) ||
+            ext.Equals(".co", StringComparison.OrdinalIgnoreCase))
+            continue;
         string targetFilePath = Path.Combine(targetDir, Path.GetFileName(file));
         File.Copy(file, targetFilePath, true); // true to overwrite existing files
     }
 
     foreach (string subDir in Directory.GetDirectories(srcDir))
     {
+        // Skip the runtime JIT code-object cache (animejanai/cache/).
+        if (Path.GetFileName(subDir).Equals("cache", StringComparison.OrdinalIgnoreCase))
+            continue;
         string newTargetDir = Path.Combine(targetDir, Path.GetFileName(subDir));
         CopyDirectory(subDir, newTargetDir);
     }
@@ -620,9 +631,13 @@ async Task MainLinux()
     Directory.CreateDirectory(installDirectory);
 
     // 1. engine libs -> animejanai/inference/ (the dispatcher loads libaji_rocm.so from
-    // its own dir). aji_rocm links MIGraphX + HIP from the SYSTEM ROCm install (rpath
-    // /opt/rocm/lib) — ROCm must be installed; nothing ROCm is bundled (it's gigabytes,
-    // like CUDA for the TensorRT backend).
+    // its own dir). aji_rocm links MIGraphX + HIP + hipRTC from the SYSTEM ROCm install
+    // (rpath /opt/rocm/lib) — ROCm must be installed; nothing ROCm is bundled (it's
+    // gigabytes, like CUDA for the TensorRT backend). Runtime prereqs on the target:
+    // libmigraphx_c.so.3, libamdhip64.so.7, libhiprtc.so (the color kernels are arch-
+    // agnostic and JIT-compile per-GPU at first run, caching to animejanai/cache/*.co;
+    // any standard ROCm 5.x+ install provides all three). Rebuild this .so from
+    // animejanai-inference linux-vulkan-backend (a2692c4+): plain C++, no HIP arch list.
     var inference = Path.Combine(installDirectory, "animejanai", "inference");
     Directory.CreateDirectory(inference);
     foreach (var so in new[] { "libaji.so", "libaji_rocm.so" })
@@ -681,9 +696,13 @@ async Task MainLinux()
     // (e.g. "playlist-add  1" is a prefix of "playlist-add  10").
     var inp = Path.Combine(pc, "input-animejanai.conf");
     File.WriteAllText(inp, File.ReadAllText(inp)
-        // Ctrl+E "Launch Manager" -> the Linux ConfEditor binary (forward slashes, no .exe)
-        .Replace("~~\\..\\AnimeJaNaiManager.exe", "~~/../AnimeJaNaiManager")
-        .Replace("~~/../AnimeJaNaiManager.exe",  "~~/../AnimeJaNaiManager")
+        // Ctrl+E "Launch Manager" -> the Linux ConfEditor binary (forward slashes, no .exe).
+        // The source line has DOUBLE backslashes ("~~\\..\\AnimeJaNaiManager.exe", mpv.net's
+        // escaped Windows path), so the C# pattern needs four backslashes to match two; a
+        // single-backslash pattern silently no-ops and ships the broken Windows path.
+        .Replace("~~\\\\..\\\\AnimeJaNaiManager.exe", "~~/../AnimeJaNaiManager")
+        .Replace("~~\\..\\AnimeJaNaiManager.exe",     "~~/../AnimeJaNaiManager")
+        .Replace("~~/../AnimeJaNaiManager.exe",       "~~/../AnimeJaNaiManager")
         // right-click menu -> uosc's menu (built from #menu: items); command palette
         // (F1) -> uosc/keybinds (its searchable command list), not a 2nd copy of the menu
         .Replace("script-message-to mpvnet show-menu",            "script-binding uosc/menu")
@@ -793,16 +812,24 @@ async Task InstallUoscLinux(string portableConfig)
         CopyDirectory(Path.Combine(fromDir, "scripts", "uosc"),
                       Path.Combine(portableConfig, "scripts", "uosc"));
         CopyDirectory(Path.Combine(fromDir, "fonts"), Path.Combine(portableConfig, "fonts"));
-        return;
+    }
+    else
+    {
+        Console.WriteLine("Downloading uosc...");
+        var zip = Path.GetFullPath("uosc.zip");
+        await DownloadFileAsync(
+            "https://github.com/tomasklaen/uosc/releases/latest/download/uosc.zip",
+            zip, (progress) => Console.WriteLine($"Downloading uosc ({progress}%)..."));
+        ExtractZip(zip, portableConfig, _ => { });
+        File.Delete(zip);
     }
 
-    Console.WriteLine("Downloading uosc...");
-    var zip = Path.GetFullPath("uosc.zip");
-    await DownloadFileAsync(
-        "https://github.com/tomasklaen/uosc/releases/latest/download/uosc.zip",
-        zip, (progress) => Console.WriteLine($"Downloading uosc ({progress}%)..."));
-    ExtractZip(zip, portableConfig, _ => { });
-    File.Delete(zip);
+    // uosc shells out to its bundled ziggy helper (file browser / Open Files, clipboard
+    // paste, updater) by path. The release zip / a plain copy doesn't carry a +x bit and
+    // mpv can't exec a non-executable file, so without this those uosc features fail with
+    // "Calling ziggy failed". (The Windows ziggy.exe needs no exec bit.)
+    var ziggy = Path.Combine(portableConfig, "scripts", "uosc", "bin", "ziggy-linux");
+    if (File.Exists(ziggy)) SetExec(ziggy);
 }
 
 // The released package is the slim core: everything hardware-specific
