@@ -859,7 +859,12 @@ async Task<PackIndex> GetPackIndexAsync()
     List<Asset> assets;
     if (!string.IsNullOrEmpty(local))
     {
-        json = File.ReadAllText(Path.Combine(local, "packs.json"));
+        // prefer the RID-suffixed index (what the pack emitter writes on Linux),
+        // falling back to the unsuffixed Windows name
+        var localIdx = new[] { $"packs-{platformRid}.json", "packs.json" }
+            .Select(n => Path.Combine(local, n)).FirstOrDefault(File.Exists)
+            ?? Path.Combine(local, "packs.json");
+        json = File.ReadAllText(localIdx);
         assets = Directory.GetFiles(local, "component-*.7z")
             .Select(f => new Asset(Path.GetFileName(f), f)).ToList();
     }
@@ -989,7 +994,46 @@ List<string> RecommendedPacks(PackIndex index, bool hasNvidia, string sm)
         // (JIT-compiles for newer GPUs than this TensorRT knows)
         rec.Add(index.Packs.Any(p => p.Name == $"trt-{sm}") ? $"trt-{sm}" : "trt-ptx");
     }
+    else if (DetectAmd())
+    {
+        // AMD: the ROCm/MIGraphX fast path (needs a system ROCm install, which
+        // no pack can carry) plus the vendor-neutral Vulkan backend as fallback.
+        if (index.Packs.Any(p => p.Name == "rocm")) rec.Add("rocm");
+        if (index.Packs.Any(p => p.Name == "vulkan")) rec.Add("vulkan");
+    }
+    else if (!OperatingSystem.IsWindows() && index.Packs.Any(p => p.Name == "vulkan"))
+    {
+        // other Linux GPUs (Intel etc.): the portable Vulkan backend is the
+        // only inference path
+        rec.Add("vulkan");
+    }
     return rec;
+}
+
+// AMD detection (Linux): amdgpu sysfs vendor id 0x1002. NVML-style probing has
+// no AMD equivalent that ships with the driver, and this needs no tools.
+static bool DetectAmd()
+{
+    try
+    {
+        if (!OperatingSystem.IsLinux())
+        {
+            return false;
+        }
+        foreach (var card in Directory.GetDirectories("/sys/class/drm", "card*"))
+        {
+            var vendor = Path.Combine(card, "device", "vendor");
+            if (File.Exists(vendor) && File.ReadAllText(vendor).Trim() == "0x1002")
+            {
+                return true;
+            }
+        }
+    }
+    catch
+    {
+        // sysfs unavailable: treat as not-AMD
+    }
+    return false;
 }
 
 bool ComponentsNeverManaged() => !File.Exists(Path.Combine(installDir, "components.json"));
@@ -1011,7 +1055,7 @@ async Task ComponentsAsync(PackIndex? prefetched, bool json = false)
         {
             package_version = index.PackageVersion,
             version_mismatch = PackVersionMismatch(index),
-            gpu = new { nvidia = hasNvidia, sm, name = gpu },
+            gpu = new { nvidia = hasNvidia, amd = DetectAmd(), sm, name = gpu },
             packs = index.Packs.Select(p => new
             {
                 name = p.Name,

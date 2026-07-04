@@ -58,6 +58,11 @@ const string MpvForkGitHash       = "b903de7812";   // git short hash (master; a
 // Linux mpv bundle: a github.com/the-database/mpv release asset (tar.zst).
 // Overridable via MPV_LINUX_LOCAL (a local meson build dir, e.g. ~/src/mpv/build).
 const string MpvForkLinuxVersion  = "2026-06-20-b903de7";
+// Local AMD-backend builds (animejanai-inference, branch linux-vulkan-backend).
+// Bump when the pack contents change: these version the 'rocm'/'vulkan' manifest
+// deps keys that gate the updater's skip-if-unchanged component check.
+const string RocmBackendVersion   = "rocm-v0.1";
+const string VulkanBackendVersion = "vk-v0.1";
 
 // ---------------------------------------------------------------------------
 // Target / platform descriptor
@@ -699,6 +704,10 @@ void WriteVersionAndManifest()
             ort_dml = plat.IsWindows ? $"{OrtDmlVersion}+{DirectMLVersion}" : (string?)null,
             sevenzip = SevenZipVersion,
             rife = RifeModelsVersion,
+            // AMD/portable backend packs (Linux packages only): these version the
+            // 'rocm'/'vulkan' component packs for the skip-if-unchanged check.
+            rocm = plat.IsWindows ? (string?)null : RocmBackendVersion,
+            vulkan = plat.IsWindows ? (string?)null : VulkanBackendVersion,
         },
         overlay_paths = overlayPaths.ToArray(),
         // User data never overwritten by an update (full updates preserve these explicitly).
@@ -876,9 +885,11 @@ async Task Main()
 // once the engine + mpv fork publish Linux release assets these become downloads.
 async Task MainLinux()
 {
-    Console.WriteLine("Assembling the Linux (ROCm/MIGraphX) package...");
+    Console.WriteLine("Assembling the Linux (ROCm/MIGraphX + ncnn-Vulkan) package...");
     string home     = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
-    string ajiBuild = Environment.GetEnvironmentVariable("AJI_LINUX_BUILD_DIR") ?? Path.Combine(home, "Projects/animejanai-inference/build");
+    // build-vk is the cmake tree that builds ALL the Linux backends (libaji.so
+    // dispatcher + libaji_rocm.so + libaji_vk.so + aji_rocm_compile + spv/).
+    string ajiBuild = Environment.GetEnvironmentVariable("AJI_LINUX_BUILD_DIR") ?? Path.Combine(home, "Projects/animejanai-inference/build-vk");
     string mpvBin   = Environment.GetEnvironmentVariable("MPV_FORK_BIN")        ?? "/tmp/mpvfork/build/mpv";
 
     if (Directory.Exists(installDirectory)) Directory.Delete(installDirectory, true);
@@ -896,6 +907,44 @@ async Task MainLinux()
     Directory.CreateDirectory(inference);
     foreach (var so in new[] { "libaji.so", "libaji_rocm.so" })
         File.Copy(Path.Combine(ajiBuild, so), Path.Combine(inference, so), true);
+    // aji_rocm_compile: the out-of-process MIGraphX engine compiler. The ROCm
+    // backend fork/execs it (found next to libaji_rocm.so via dladdr) so a player
+    // quit mid-compile SIGKILLs the child instead of racing process-exit teardown.
+    var rocmCompile = Path.Combine(ajiBuild, "aji_rocm_compile");
+    if (File.Exists(rocmCompile))
+    {
+        var rcDst = Path.Combine(inference, "aji_rocm_compile");
+        File.Copy(rocmCompile, rcDst, true);
+        SetExec(rcDst);
+    }
+
+    // 1b. the vendor-neutral ncnn-Vulkan backend (libaji_vk + the gridsample
+    // libncnn build + compiled shaders), bundled when a build is available. Runs
+    // on any Vulkan GPU (AMD/NVIDIA/Intel) with no system ROCm/CUDA install;
+    // --packs emits it as the 'vulkan' component pack. NEVER bundle
+    // libvulkan.so.1 (the loader): it must come from the target system or the
+    // package segfaults cross-vendor (verified on an NVIDIA RTX 4090).
+    var vkLib   = Path.Combine(ajiBuild, "libaji_vk.so");
+    var ncnnLib = Environment.GetEnvironmentVariable("NCNN_LINUX_LIB")
+                  ?? Path.Combine(home, "Projects/ncnn-vk/build-fast/src/libncnn.so.1");
+    bool vkBundled = File.Exists(vkLib) && File.Exists(ncnnLib);
+    if (vkBundled)
+    {
+        File.Copy(vkLib, Path.Combine(inference, "libaji_vk.so"), true);
+        // -L semantics: resolve the libncnn.so.1 -> libncnn.so.1.x.y symlink
+        File.Copy(new FileInfo(ncnnLib).LinkTarget is string lt
+            ? Path.Combine(Path.GetDirectoryName(Path.GetFullPath(ncnnLib))!, lt)
+            : ncnnLib,
+            Path.Combine(inference, "libncnn.so.1"), true);
+        var spvSrc = Path.Combine(ajiBuild, "spv");
+        if (Directory.Exists(spvSrc))
+            CopyDirectory(spvSrc, Path.Combine(inference, "spv"));
+        Console.WriteLine("  Vulkan (ncnn) backend bundled");
+    }
+    else
+    {
+        Console.WriteLine("  (libaji_vk.so/libncnn.so.1 not found; package built without the Vulkan backend)");
+    }
 
     // 2. mpv fork binary (standalone; libmpv is embedded)
     var mpvDst = Path.Combine(installDirectory, "mpv");
@@ -912,6 +961,41 @@ async Task MainLinux()
     var modelDir = Path.Combine(installDirectory, "animejanai", "onnx");
     int onnxCount = Directory.Exists(modelDir) ? Directory.GetFiles(modelDir, "*.onnx").Length : 0;
     Console.WriteLine($"  {onnxCount} .onnx models shipped for MIGraphX");
+    // 4b. ncnn conversions of the same models for the Vulkan backend (the Manager's
+    // model dropdown unions .onnx and .param names, so pairs sit alongside cleanly).
+    var ncnnModels = Environment.GetEnvironmentVariable("AJI_NCNN_MODELS_DIR")
+                     ?? Path.Combine(home, ".cache/animejanai-assets/onnx");
+    if (vkBundled && Directory.Exists(ncnnModels))
+    {
+        int pairs = 0;
+        foreach (var f in Directory.GetFiles(ncnnModels)
+                     .Where(f => f.EndsWith(".param") || f.EndsWith(".bin")))
+        {
+            File.Copy(f, Path.Combine(modelDir, Path.GetFileName(f)), true);
+            if (f.EndsWith(".param")) pairs++;
+        }
+        Console.WriteLine($"  {pairs} ncnn model pairs shipped for the Vulkan backend");
+    }
+    // 4c. RIFE models: ROCm/TensorRT run the fp16 .onnx, the Vulkan backend the
+    // ncnn conversions (tools/rife_ncnn in the engine repo — all 46 selectable
+    // pack models convert + validate). The default source ships the engine-default
+    // models; point AJI_RIFE_DIR at a merged dir (all pack .onnx + conversions)
+    // for a full-coverage build. The whole dir rides the 'rife' component pack.
+    var rifeSrc = Environment.GetEnvironmentVariable("AJI_RIFE_DIR")
+                  ?? Path.Combine(home, ".cache/animejanai-assets/rife");
+    if (Directory.Exists(rifeSrc))
+    {
+        var rifeDst = Path.Combine(installDirectory, "animejanai", "rife");
+        Directory.CreateDirectory(rifeDst);
+        int rifeFiles = 0;
+        foreach (var f in Directory.GetFiles(rifeSrc)
+                     .Where(f => f.EndsWith(".onnx") || f.EndsWith(".param") || f.EndsWith(".bin")))
+        {
+            File.Copy(f, Path.Combine(rifeDst, Path.GetFileName(f)), true);
+            rifeFiles++;
+        }
+        Console.WriteLine($"  {rifeFiles} RIFE model files shipped (animejanai/rife)");
+    }
 
     // 5. Linux conf rewrites (Windows source files untouched; only the assembled copies change)
     // Preserve the shipped default conf (the [slot_1..9] "New Profile" placeholders the
@@ -990,10 +1074,6 @@ async Task MainLinux()
         .Replace("script-message-to mpvnet shell-execute ",       "run xdg-open ")
         // osc=no killed the built-in OSC, so "Toggle OSC Visibility" -> uosc's UI toggle
         .Replace("script-binding osc/visibility",                 "script-binding uosc/toggle-ui")
-        // no Linux auto-updater: make "AnimeJaNai > Install Update" a no-op instead of
-        // firing a dead script-message (the animejanai_update.lua script is removed below)
-        .Replace("Ctrl+u           script-message animejanai-update #menu: AnimeJaNai > Install Update",
-                 "#Ctrl+u          script-message animejanai-update (no Linux updater)")
         // AnimeJaNai upscale slots, mouse-reachable from the menu (the !/@/SHARP/Ctrl+N
         // keys still switch slots; uosc nests these under AnimeJaNai > Upscale by path)
         + "\n\n# Linux: expose the upscale slots in the uosc menu (menu-only entries)\n"
@@ -1001,10 +1081,30 @@ async Task MainLinux()
         + "_  apply-profile upscale-on; show-text \"AnimeJaNai: Quality\"; script-message aji-slot 1001    #menu: AnimeJaNai > Upscale > Quality\n"
         + "_  apply-profile upscale-on; show-text \"AnimeJaNai: Balanced\"; script-message aji-slot 1002   #menu: AnimeJaNai > Upscale > Balanced\n"
         + "_  apply-profile upscale-on; show-text \"AnimeJaNai: Performance\"; script-message aji-slot 1003 #menu: AnimeJaNai > Upscale > Performance\n");
-    // the auto-updater is Windows-only (no Linux AnimeJaNaiUpdater build); drop its
-    // script so it doesn't error a failed subprocess on every launch.
-    var updScript = Path.Combine(pc, "scripts", "animejanai_update.lua");
-    if (File.Exists(updScript)) File.Delete(updScript);
+    // updates: animejanai_update.lua is already cross-platform (it picks the
+    // extensionless updater binary by mpv platform). Bundle a published linux-x64
+    // AnimeJaNaiUpdater when one is available; without one, drop the lua so it
+    // doesn't error a failed subprocess on every launch (previous behavior).
+    var updaterBin = Environment.GetEnvironmentVariable("AJI_UPDATER_BIN")
+        ?? new[]
+        {
+            Path.Combine(assemblyDirectory, "AnimeJaNaiUpdater"),
+            Path.GetFullPath("../AnimeJaNaiUpdater/bin/Release/net10.0/linux-x64/publish/AnimeJaNaiUpdater"),
+            Path.GetFullPath("AnimeJaNaiUpdater/bin/Release/net10.0/linux-x64/publish/AnimeJaNaiUpdater"),
+        }.FirstOrDefault(File.Exists);
+    if (updaterBin != null && File.Exists(updaterBin))
+    {
+        var updDst = Path.Combine(installDirectory, "AnimeJaNaiUpdater");
+        File.Copy(updaterBin, updDst, true);
+        SetExec(updDst);
+        Console.WriteLine("  AnimeJaNaiUpdater bundled (self-update + component installs enabled)");
+    }
+    else
+    {
+        Console.WriteLine("  (no linux-x64 AnimeJaNaiUpdater publish found; package built without self-update)");
+        var updScript = Path.Combine(pc, "scripts", "animejanai_update.lua");
+        if (File.Exists(updScript)) File.Delete(updScript);
+    }
 
     GenerateInputConf();
 
@@ -1036,7 +1136,16 @@ async Task MainLinux()
         Console.WriteLine($"  (ConfEditor not found at {confDir}; package built without the Manager GUI)");
     }
 
-    File.WriteAllText(Path.Combine(installDirectory, "version.txt"), args[0]);
+    // 8. the update/components model: 7zz (the manifest archive_tool) + version.txt
+    // + manifest.json — the same trio the release assembler writes, so the
+    // cross-platform AnimeJaNaiUpdater can --check/--apply/--install/--components
+    // against this package exactly like against a release install.
+    try { await InstallSevenZip(); }
+    catch (Exception e)
+    {
+        Console.WriteLine($"  (7zz not bundled: {e.Message} — updater --apply/--install will need it)");
+    }
+    WriteVersionAndManifest();
     Console.WriteLine($"Linux package assembled at {installDirectory}");
 }
 
@@ -1157,7 +1266,39 @@ async Task<List<string>> EmitComponentPacks()
             })
             .Select(f => Path.GetRelativePath(installDirectory, f)).ToArray()),
         ("rife", "rife", new[] { Path.GetRelativePath(installDirectory, rifePath) }),
+        // AMD/portable backends (present only in trees assembled with the Linux
+        // ROCm/Vulkan stack; the nothing-to-pack skip below drops them elsewhere).
+        // 'rocm' needs a system ROCm install at runtime; 'vulkan' runs on any
+        // Vulkan GPU and carries its compiled shaders + ncnn-converted models.
+        ("rocm", "rocm", new[]
+        {
+            "animejanai/inference/libaji_rocm.so",
+            "animejanai/inference/aji_rocm_compile",
+        }.Where(f => File.Exists(Path.Combine(installDirectory, f))).ToArray()),
+        ("vulkan", "vulkan", VulkanPackFiles()),
     };
+
+    string[] VulkanPackFiles()
+    {
+        if (!File.Exists(Path.Combine(inferencePath, "libaji_vk.so")))
+        {
+            return Array.Empty<string>();
+        }
+        var vk = new List<string>
+        {
+            "animejanai/inference/libaji_vk.so",
+            "animejanai/inference/libncnn.so.1",
+        };
+        if (Directory.Exists(Path.Combine(inferencePath, "spv")))
+        {
+            vk.Add("animejanai/inference/spv");
+        }
+        // the ncnn .param/.bin conversions of the shipped .onnx models
+        vk.AddRange(Directory.GetFiles(onnxPath, "*.param")
+            .Concat(Directory.GetFiles(onnxPath, "*.bin"))
+            .Select(f => Path.GetRelativePath(installDirectory, f).Replace('\\', '/')));
+        return vk.ToArray();
+    }
     foreach (var f in Directory.GetFiles(inferencePath, "*builder_resource_*"))
     {
         // Windows: nvinfer_builder_resource_sm120_11.dll -> trt-sm120
@@ -1234,8 +1375,11 @@ if (packsOnlyIndex >= 0)
 {
     await EmitComponentPacks();
 }
-else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+else if (Array.IndexOf(args, "--target") < 0 && RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
 {
+    // No explicit --target on a Linux host = the local dev assembly from this
+    // machine's build trees (ROCm/Vulkan backends). CI and release builds pass
+    // --target and always take the release assembler (Main), on any host.
     await MainLinux();
 }
 else
