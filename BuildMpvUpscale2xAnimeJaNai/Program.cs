@@ -11,7 +11,8 @@
 // the install steps read from it instead of hardcoding Windows assumptions.
 // On Linux the DirectML/ONNX-Runtime backend and mpv.net are dropped (mpv.net
 // does not run on Linux; DirectML is Windows-only); the player becomes
-// upstream mpv/libmpv driven by portable_config via --config-dir.
+// upstream mpv/libmpv driven by portable_config via --config-dir, with uosc
+// as the UI and the mpv.net keybindings ported to it (PortConfigsForTarget).
 using ICSharpCode.SharpZipLib.Core;
 using ICSharpCode.SharpZipLib.Zip;
 using SevenZipExtractor;
@@ -103,6 +104,13 @@ const string MpvForkLinuxVersion  = "2026-10-13-e88bd2c";
 // deps keys that gate the updater's skip-if-unchanged component check.
 const string RocmBackendVersion   = "rocm-v0.1";
 const string VulkanBackendVersion = "vk-v0.1";
+
+// uosc (github.com/tomasklaen/uosc): the player UI (control bar + context
+// menu) on the stock-mpv targets, which have no mpv.net interface. uosc
+// publishes no checksum beside its zip, so like TrtSha256Win the hash is
+// recorded from a verified download and enforced on every build.
+const string UoscVersion          = "5.13.0";
+const string UoscSha256           = "4be9da3289285300fa374496c3f1bfd7bb20ac08e890d25bd5a06b28eebe4882";
 
 // ---------------------------------------------------------------------------
 // Target / platform descriptor
@@ -733,26 +741,116 @@ void GenerateInputConf()
 
 // Keep the runtime configs a single source: on non-Windows targets, rewrite
 // the handful of platform-specific literals in the laid-down portable_config
-// (the vf=@aji line's library/tool filenames, the OSD font, the Manager
-// launcher path) rather than forking the whole files. Runs before
-// GenerateInputConf so the managed input.conf block inherits the ported line.
-// hwdec=nvdec / vo=gpu-next / gpu-api=vulkan already work on Linux as-is.
-void PortConfigsForTarget()
+// (the vf=@aji line's library/tool filenames, the OSD font) rather than
+// forking the whole files, port the mpv.net-only keybindings to stock mpv +
+// uosc (PortInputConfForStockMpv) and bundle uosc itself (InstallUosc). Runs
+// before GenerateInputConf so the managed input.conf block inherits the
+// ported lines. A no-op on Windows, and idempotent: a second run over an
+// already-ported tree leaves every file byte-identical. hwdec=nvdec /
+// vo=gpu-next / gpu-api=vulkan already work on Linux as-is.
+async Task PortConfigsForTarget()
 {
     if (plat.IsWindows) return;
     var pc = Path.Combine(installDirectory, "portable_config");
 
     var mpvConf = Path.Combine(pc, "mpv-animejanai.conf");
-    var c = File.ReadAllText(mpvConf)
+    var c = File.ReadAllText(mpvConf).Replace("\r\n", "\n")
         .Replace("inference/aji.dll", "inference/libaji.so")
         .Replace("inference/trtexec.exe", "inference/trtexec")
         .Replace("'Segoe UI'", "'sans-serif'");
+    // Stock mpv has no mpv.net UI, so uosc draws the control bar and the OSD;
+    // a live built-in OSC / OSD bar would double up with it. Kept at the
+    // top-level scope next to profile-restore (the one option documented as
+    // staying there), so it holds even when the user's mpv.conf does not
+    // apply the [animejanai] profile.
+    const string oscAnchor = "profile-restore=copy-equal\n";
+    if (!c.Contains("\nosc=no\n"))
+    {
+        if (!c.Contains(oscAnchor))
+            throw new InvalidOperationException("mpv-animejanai.conf: profile-restore anchor not found for the osc=no port");
+        c = c.Replace(oscAnchor, oscAnchor +
+            "# uosc (scripts/uosc) replaces the built-in OSC and OSD bar on stock mpv.\n" +
+            "osc=no\nosd-bar=no\n");
+    }
     File.WriteAllText(mpvConf, c);
 
     var inputConf = Path.Combine(pc, "input-animejanai.conf");
-    var ic = File.ReadAllText(inputConf)
-        .Replace("~~\\\\..\\\\AnimeJaNaiManager.exe", "~~/../AnimeJaNaiManager");
-    File.WriteAllText(inputConf, ic);
+    File.WriteAllText(inputConf, PortInputConfForStockMpv(File.ReadAllText(inputConf)));
+
+    await InstallUosc(pc);
+}
+
+// Appended by PortInputConfForStockMpv; its presence marks a file that is
+// already ported, so a second pass returns the input untouched.
+const string StockMpvPortMarker = "# Stock mpv (uosc): expose the upscale slots in the context menu (menu-only entries)";
+
+// Port the mpv.net menu/keybindings to stock mpv + uosc. mpv.net's
+// `script-message-to mpvnet ...` commands are dead without mpv.net (mpv just
+// logs "no client mpvnet"), so the load-bearing ones are remapped to uosc (the
+// bundled UI script, which builds its right-click menu from the #menu:
+// annotations) or to native mpv commands, and whatever is still addressed to
+// mpvnet afterwards - mpv.net-only features with no stock-mpv equivalent (its
+// config/input editors, profile pickers, file associations, history, about
+// box, ...) - is dropped, #menu: entry and all, instead of shipping as a dead
+// binding. Pure text -> text, so it is unit-testable; idempotent via
+// StockMpvPortMarker. Order matters inside the chain: longer patterns first,
+// so a prefix match can't eat a longer line (e.g. "playlist-add  1" is a
+// prefix of "playlist-add  10").
+string PortInputConfForStockMpv(string text)
+{
+    if (text.Contains(StockMpvPortMarker)) return text;
+    var t = text.Replace("\r\n", "\n")
+        // right-click menu -> uosc's menu (built from #menu: items); command palette
+        // (F1) -> uosc/keybinds (its searchable command list), not a 2nd copy of the menu
+        .Replace("script-message-to mpvnet show-menu",            "script-binding uosc/menu")
+        .Replace("script-message-to mpvnet show-command-palette", "script-binding uosc/keybinds")
+        // open files / URL from clipboard / external audio+subtitle loaders -> uosc's
+        // dedicated bindings (uosc/load-audio and uosc/load-subtitles open a file
+        // browser; the track SELECTORS below stay uosc/audio + uosc/subtitles)
+        .Replace("script-message-to mpvnet open-files append",    "script-binding uosc/open-file")
+        .Replace("script-message-to mpvnet open-files",           "script-binding uosc/open-file")
+        .Replace("script-message-to mpvnet open-clipboard",       "script-binding uosc/paste-to-open")
+        .Replace("script-message-to mpvnet load-audio",           "script-binding uosc/load-audio")
+        .Replace("script-message-to mpvnet load-sub",             "script-binding uosc/load-subtitles")
+        .Replace("script-message-to mpvnet show-playlist",        "script-binding uosc/playlist")
+        .Replace("script-message-to mpvnet show-audio-tracks",    "script-binding uosc/audio")
+        .Replace("script-message-to mpvnet show-subtitle-tracks", "script-binding uosc/subtitles")
+        .Replace("script-message-to mpvnet show-chapters",        "script-binding uosc/chapters")
+        .Replace("script-message-to mpvnet show-audio-devices",   "script-binding uosc/audio-device")
+        .Replace("script-message-to mpvnet open-conf-folder",     "script-binding uosc/open-config-directory")
+        // file/media info -> the stats overlay
+        .Replace("script-message-to mpvnet show-media-info osd",  "script-binding stats/display-stats-toggle")
+        .Replace("script-message-to mpvnet show-media-info",      "script-binding stats/display-stats-toggle")
+        .Replace("script-message-to mpvnet show-info",            "script-binding stats/display-stats-toggle")
+        // playback + playlist navigation -> native commands
+        .Replace("script-message-to mpvnet play-pause",           "cycle pause")
+        .Replace("script-message-to mpvnet playlist-add -10",     "playlist-prev")
+        .Replace("script-message-to mpvnet playlist-add  10",     "playlist-next")
+        .Replace("script-message-to mpvnet playlist-add -1",      "playlist-prev")
+        .Replace("script-message-to mpvnet playlist-add  1",      "playlist-next")
+        .Replace("script-message-to mpvnet playlist-first",       "playlist-play-index 0")
+        .Replace("script-message-to mpvnet playlist-last",        "playlist-play-index -1")
+        .Replace("script-message-to mpvnet cycle-audio",          "cycle audio")
+        .Replace("script-message-to mpvnet show-progress",        "show-progress")
+        // window zoom (commented out in the source; kept as the native equivalents)
+        .Replace("script-message-to mpvnet scale-window ",        "multiply window-scale ")
+        .Replace("script-message-to mpvnet window-scale ",        "set window-scale ")
+        // external links -> the platform opener
+        .Replace("script-message-to mpvnet shell-execute ",       "run xdg-open ")
+        // osc=no killed the built-in OSC, so "Toggle OSC Visibility" -> uosc's UI toggle
+        .Replace("script-binding osc/visibility",                 "script-binding uosc/toggle-ui");
+    // Whatever is still addressed to mpvnet has no stock-mpv equivalent; the
+    // Help > ... mpv.net links point at a player this target does not ship.
+    var lines = t.Split('\n').Where(l =>
+        !l.Contains("script-message-to mpvnet") &&
+        !(l.Contains("#menu:") && l.Contains("stax76/mpv.net")));
+    // AnimeJaNai upscale slots, mouse-reachable from the menu (the !/@/SHARP/Ctrl+N
+    // keys still switch slots; uosc nests these under AnimeJaNai > Upscale by path).
+    return string.Join("\n", lines).TrimEnd('\n') + "\n\n" + StockMpvPortMarker + "\n"
+        + "_  apply-profile upscale-on; show-text \"AnimeJaNai: Off\"; script-message aji-slot 0          #menu: AnimeJaNai > Upscale > Off\n"
+        + "_  apply-profile upscale-on; show-text \"AnimeJaNai: Quality\"; script-message aji-slot 1001    #menu: AnimeJaNai > Upscale > Quality\n"
+        + "_  apply-profile upscale-on; show-text \"AnimeJaNai: Balanced\"; script-message aji-slot 1002   #menu: AnimeJaNai > Upscale > Balanced\n"
+        + "_  apply-profile upscale-on; show-text \"AnimeJaNai: Performance\"; script-message aji-slot 1003 #menu: AnimeJaNai > Upscale > Performance\n";
 }
 
 // Linux launcher: runs the bundled mpv against portable_config via
@@ -1120,7 +1218,7 @@ async Task Main()
     }
     await InstallYtDlp();
     InstallAnimeJaNaiCore();
-    PortConfigsForTarget();
+    await PortConfigsForTarget();
     GenerateInputConf();
     await InstallAnimeJaNaiManager();
     WriteThirdPartyNotices();
@@ -1253,11 +1351,17 @@ async Task MainLinux()
         Console.WriteLine($"  {rifeFiles} RIFE model files shipped (animejanai/rife)");
     }
 
-    // 5. Linux conf rewrites (Windows source files untouched; only the assembled copies change)
-    // Preserve the shipped default conf (the [slot_1..9] "New Profile" placeholders the
-    // Manager edits) for parity; only swap the backend to the ROCm dispatcher. Built-in
-    // slots 1001/1002/1003 (single-model presets) and any custom multi-model chains the
-    // user defines via the Manager both work on aji_rocm; default_slot stays 1002.
+    // 5. the shared stock-mpv port (libaji.so / trtexec / font literals, the
+    // mpv.net -> uosc keybinding translation, osc=no, and the uosc bundle) -
+    // the same code the release assembler runs for --target linux-x64.
+    await PortConfigsForTarget();
+
+    // 5a. AMD-backend deltas on top (Windows source files untouched; only the
+    // assembled copies change). Preserve the shipped default conf (the
+    // [slot_1..9] "New Profile" placeholders the Manager edits) for parity; only
+    // swap the backend to the ROCm dispatcher. Built-in slots 1001/1002/1003
+    // (single-model presets) and any custom multi-model chains the user defines
+    // via the Manager both work on aji_rocm; default_slot stays 1002.
     var ajiConf = Path.Combine(installDirectory, "animejanai", "animejanai.conf");
     if (File.Exists(ajiConf))
         File.WriteAllText(ajiConf, File.ReadAllText(ajiConf)
@@ -1269,74 +1373,15 @@ async Task MainLinux()
     var pc  = Path.Combine(installDirectory, "portable_config");
     var mac = Path.Combine(pc, "mpv-animejanai.conf");
     File.WriteAllText(mac, File.ReadAllText(mac)
-        .Replace("lib=~~/../animejanai/inference/aji.dll", "lib=~~/../animejanai/inference/libaji.so")
-        .Replace(":trtexec=~~/../animejanai/inference/trtexec.exe", "")
+        // no TensorRT in this package, so no trtexec (the shared port already
+        // renamed it from trtexec.exe)
+        .Replace(":trtexec=~~/../animejanai/inference/trtexec", "")
         .Replace("hwdec=nvdec", "hwdec=no")
         .Replace("gpu-api=vulkan,auto", "gpu-api=auto")
-        // vulkan-queue-count is a Vulkan-VO option; the upscaling is on ncnn-Vulkan
-        // and the VO renders via gpu-next/libplacebo, so comment it out (it errors on
-        // an mpv built without the legacy Vulkan VO). Also turn off mpv's built-in OSC
-        // and OSD bar here (global scope, above the profile sections): stock mpv has no
-        // mpv.net UI, so the bundled uosc (scripts/uosc) draws the control bar instead,
-        // and a live built-in OSC would double up with it.
-        .Replace("vulkan-queue-count=3",
-            "#vulkan-queue-count=3\nosc=no\nosd-bar=no"));
-    // Port the mpv.net menu to stock mpv. mpv.net's `script-message-to mpvnet ...`
-    // commands are dead without mpv.net, so remap the load-bearing ones to uosc (the
-    // bundled UI script, which builds its right-click menu from the #menu: annotations
-    // below) and to native mpv commands. uosc's control bar covers the rest; any
-    // remaining mpvnet command is a harmless no-op (mpv just logs "no client mpvnet").
-    // Order matters: longer patterns first, so a prefix match can't eat a longer line
-    // (e.g. "playlist-add  1" is a prefix of "playlist-add  10").
-    var inp = Path.Combine(pc, "input-animejanai.conf");
-    File.WriteAllText(inp, File.ReadAllText(inp)
-        // Ctrl+E "Launch Manager" -> the Linux ConfEditor binary (forward slashes, no .exe).
-        // The source line has DOUBLE backslashes ("~~\\..\\AnimeJaNaiManager.exe", mpv.net's
-        // escaped Windows path), so the C# pattern needs four backslashes to match two; a
-        // single-backslash pattern silently no-ops and ships the broken Windows path.
-        .Replace("~~\\\\..\\\\AnimeJaNaiManager.exe", "~~/../AnimeJaNaiManager")
-        .Replace("~~\\..\\AnimeJaNaiManager.exe",     "~~/../AnimeJaNaiManager")
-        .Replace("~~/../AnimeJaNaiManager.exe",       "~~/../AnimeJaNaiManager")
-        // right-click menu -> uosc's menu (built from #menu: items); command palette
-        // (F1) -> uosc/keybinds (its searchable command list), not a 2nd copy of the menu
-        .Replace("script-message-to mpvnet show-menu",            "script-binding uosc/menu")
-        .Replace("script-message-to mpvnet show-command-palette", "script-binding uosc/keybinds")
-        // open files / external audio+subtitle loaders -> uosc's dedicated bindings
-        // (uosc/load-audio and uosc/load-subtitles open a file browser; the track
-        // SELECTORS below stay uosc/audio + uosc/subtitles)
-        .Replace("script-message-to mpvnet open-files append",    "script-binding uosc/open-file")
-        .Replace("script-message-to mpvnet open-files",           "script-binding uosc/open-file")
-        .Replace("script-message-to mpvnet load-audio",           "script-binding uosc/load-audio")
-        .Replace("script-message-to mpvnet load-sub",             "script-binding uosc/load-subtitles")
-        .Replace("script-message-to mpvnet show-playlist",        "script-binding uosc/playlist")
-        .Replace("script-message-to mpvnet show-audio-tracks",    "script-binding uosc/audio")
-        .Replace("script-message-to mpvnet show-subtitle-tracks", "script-binding uosc/subtitles")
-        .Replace("script-message-to mpvnet show-chapters",        "script-binding uosc/chapters")
-        // file/media info -> the stats overlay
-        .Replace("script-message-to mpvnet show-media-info osd",  "script-binding stats/display-stats-toggle")
-        .Replace("script-message-to mpvnet show-media-info",      "script-binding stats/display-stats-toggle")
-        .Replace("script-message-to mpvnet show-info",            "script-binding stats/display-stats-toggle")
-        // playback + playlist navigation -> native commands
-        .Replace("script-message-to mpvnet play-pause",           "cycle pause")
-        .Replace("script-message-to mpvnet playlist-add -10",     "playlist-prev")
-        .Replace("script-message-to mpvnet playlist-add  10",     "playlist-next")
-        .Replace("script-message-to mpvnet playlist-add -1",      "playlist-prev")
-        .Replace("script-message-to mpvnet playlist-add  1",      "playlist-next")
-        .Replace("script-message-to mpvnet playlist-first",       "playlist-play-index 0")
-        .Replace("script-message-to mpvnet playlist-last",        "playlist-play-index -1")
-        .Replace("script-message-to mpvnet cycle-audio",          "cycle audio")
-        .Replace("script-message-to mpvnet show-progress",        "show-progress")
-        // external links -> the platform opener
-        .Replace("script-message-to mpvnet shell-execute ",       "run xdg-open ")
-        // osc=no killed the built-in OSC, so "Toggle OSC Visibility" -> uosc's UI toggle
-        .Replace("script-binding osc/visibility",                 "script-binding uosc/toggle-ui")
-        // AnimeJaNai upscale slots, mouse-reachable from the menu (the !/@/SHARP/Ctrl+N
-        // keys still switch slots; uosc nests these under AnimeJaNai > Upscale by path)
-        + "\n\n# Linux: expose the upscale slots in the uosc menu (menu-only entries)\n"
-        + "_  apply-profile upscale-on; show-text \"AnimeJaNai: Off\"; script-message aji-slot 0          #menu: AnimeJaNai > Upscale > Off\n"
-        + "_  apply-profile upscale-on; show-text \"AnimeJaNai: Quality\"; script-message aji-slot 1001    #menu: AnimeJaNai > Upscale > Quality\n"
-        + "_  apply-profile upscale-on; show-text \"AnimeJaNai: Balanced\"; script-message aji-slot 1002   #menu: AnimeJaNai > Upscale > Balanced\n"
-        + "_  apply-profile upscale-on; show-text \"AnimeJaNai: Performance\"; script-message aji-slot 1003 #menu: AnimeJaNai > Upscale > Performance\n");
+        // vulkan-queue-count is a Vulkan-VO option; the upscaling is on ncnn-Vulkan /
+        // MIGraphX and the VO renders via gpu-next/libplacebo, so comment it out (it
+        // errors on an mpv built without the legacy Vulkan VO).
+        .Replace("\nvulkan-queue-count=3", "\n#vulkan-queue-count=3"));
     // updates: animejanai_update.lua is already cross-platform (it picks the
     // extensionless updater binary by mpv platform). Bundle a published linux-x64
     // AnimeJaNaiUpdater when one is available; without one, drop the lua so it
@@ -1363,10 +1408,6 @@ async Task MainLinux()
     }
 
     GenerateInputConf();
-
-    // 5b. uosc: the player UI (control bar + context menu) for stock mpv, which has no
-    // mpv.net interface. Reads the #menu: annotations from the input.conf written above.
-    await InstallUoscLinux(pc);
 
     // 6. portable launcher (standalone mpv needs an explicit --config-dir)
     var launcher = Path.Combine(installDirectory, "run-animejanai");
@@ -1416,13 +1457,15 @@ void SetExec(string path) => File.SetUnixFileMode(path,
     UnixFileMode.GroupRead | UnixFileMode.GroupExecute |
     UnixFileMode.OtherRead | UnixFileMode.OtherExecute);
 
-// Bundle uosc (github.com/tomasklaen/uosc) into the Linux package's portable_config.
+// Bundle uosc (github.com/tomasklaen/uosc) into a stock-mpv target's portable_config.
 // Stock mpv has no mpv.net UI; uosc gives the control bar + the context menu (built
-// from input.conf's #menu: items). The release zip lays down scripts/uosc/ (a script
-// directory mpv auto-loads) and the icon fonts at its root, so it extracts straight
-// into portable_config. Sourced from AJI_UOSC_DIR if set (a pre-extracted release, used
-// for offline/local builds), otherwise downloaded from the latest GitHub release.
-async Task InstallUoscLinux(string portableConfig)
+// from input.conf's #menu: items, see PortInputConfForStockMpv). The release zip lays
+// down scripts/uosc/ (a script directory mpv auto-loads) and the icon fonts at its
+// root, so it extracts straight into portable_config. Sourced from AJI_UOSC_DIR if set
+// (a pre-extracted release, for offline/local builds), otherwise the UoscVersion
+// release is downloaded and checked against UoscSha256. Re-running over a tree that
+// already carries uosc just overwrites it with the same files.
+async Task InstallUosc(string portableConfig)
 {
     var fromDir = Environment.GetEnvironmentVariable("AJI_UOSC_DIR");
     if (fromDir != null && File.Exists(Path.Combine(fromDir, "scripts", "uosc", "main.lua")))
@@ -1434,11 +1477,12 @@ async Task InstallUoscLinux(string portableConfig)
     }
     else
     {
-        Console.WriteLine("Downloading uosc...");
+        Console.WriteLine($"Downloading uosc {UoscVersion}...");
         var zip = Path.GetFullPath("uosc.zip");
         await DownloadFileAsync(
-            "https://github.com/tomasklaen/uosc/releases/latest/download/uosc.zip",
+            $"https://github.com/tomasklaen/uosc/releases/download/{UoscVersion}/uosc.zip",
             zip, (progress) => Console.WriteLine($"Downloading uosc ({progress}%)..."));
+        VerifySha256(zip, UoscSha256);
         ExtractZip(zip, portableConfig, _ => { });
         File.Delete(zip);
     }
@@ -1447,8 +1491,11 @@ async Task InstallUoscLinux(string portableConfig)
     // paste, updater) by path. The release zip / a plain copy doesn't carry a +x bit and
     // mpv can't exec a non-executable file, so without this those uosc features fail with
     // "Calling ziggy failed". (The Windows ziggy.exe needs no exec bit.)
-    var ziggy = Path.Combine(portableConfig, "scripts", "uosc", "bin", "ziggy-linux");
-    if (File.Exists(ziggy)) SetExec(ziggy);
+    foreach (var helper in new[] { "ziggy-linux", "ziggy-darwin" })
+    {
+        var ziggy = Path.Combine(portableConfig, "scripts", "uosc", "bin", helper);
+        if (File.Exists(ziggy)) SetExec(ziggy);
+    }
 }
 
 // The released package is the slim core: everything hardware-specific

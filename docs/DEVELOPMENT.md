@@ -75,9 +75,11 @@ BuildMpvUpscale2xAnimeJaNai <version> [--target win-x64|linux-x64] [--packs] [--
 `InstallSevenZip` → `InstallInferenceRuntime` → `InstallAji` → `InstallOrtDml` *(Windows only)*
 → `InstallRife` → *(Windows:* `InstallMpvnet`, `InstallCustomLibmpv`, `InstallCustomMpvExe`*;
 Linux:* `InstallLinuxMpv`*)* → `InstallYtDlp` → `InstallAnimeJaNaiCore` →
-`PortConfigsForTarget` → `GenerateInputConf` → `InstallAnimeJaNaiManager` →
-`WriteThirdPartyNotices` → `WriteLinuxLauncher` → `WriteVersionAndManifest` →
-*(if `--packs`)* `EmitComponentPacks` + `SlimInstallTree`.
+`PortConfigsForTarget` *(non-Windows only: platform literals, `osc=no`, the mpv.net→uosc
+keybinding port via `PortInputConfForStockMpv`, and the uosc bundle via `InstallUosc`)* →
+`GenerateInputConf` → `InstallAnimeJaNaiManager` → `WriteThirdPartyNotices` →
+`WriteLinuxLauncher` → `WriteVersionAndManifest` → *(if `--packs`)* `EmitComponentPacks` +
+`SlimInstallTree`.
 
 That order is where to intervene: to test a change to one component, find its `Install*`
 function and use the matching override below rather than editing the function.
@@ -94,6 +96,7 @@ These env vars are the actual dev hooks. All are read in
 | `MPV_LINUX_LOCAL` | Use a local meson build dir for `mpv` + `libmpv.so*` (e.g. `~/src/mpv/build`) instead of the `the-database/mpv` release asset. |
 | `MPV_LINUX_EXTRA_LIBS` | `:`-separated dirs; globs `libplacebo.so*` into `mpv/`. Pair with `MPV_LINUX_LOCAL` when your local mpv links a libplacebo the bundle does not carry. |
 | `MANAGER_LOCAL` | A local directory (copied) **or** a zip / `tar.zst` (extracted) for the AnimeJaNai Manager, instead of its release asset. |
+| `AJI_UOSC_DIR` | Non-Windows targets: a pre-extracted uosc release (`scripts/uosc/main.lua` + `fonts/`) copied into `portable_config` instead of downloading the pinned `UoscVersion` zip (SHA-256 checked against `UoscSha256`). |
 | `TRT_LOCAL_ZIP` | Windows: an already-downloaded NVIDIA TensorRT zip, instead of re-fetching ~2 GB each run. |
 | `TRT_LINUX_ROOT` | Linux TensorRT source root (e.g. `/usr`). Reads `$root/lib/x86_64-linux-gnu` and `$root/bin/trtexec`. Unset = download the `.deb`s from NVIDIA. |
 | `CUDA_LINUX_LIB` | Source dir for `libcudart.so*`. Unset = download the CUDA redistributable archive. |
