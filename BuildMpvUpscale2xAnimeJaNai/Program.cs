@@ -13,6 +13,9 @@
 // does not run on Linux; DirectML is Windows-only); the player becomes
 // upstream mpv/libmpv driven by portable_config via --config-dir, with uosc
 // as the UI and the mpv.net keybindings ported to it (PortConfigsForTarget).
+// `--local-dev` (Linux host only) opts into the local ROCm/Vulkan dev assembly
+// (MainLinux) built from this machine's build trees instead of the release
+// assembler; it is never implied.
 using ICSharpCode.SharpZipLib.Core;
 using ICSharpCode.SharpZipLib.Zip;
 using SevenZipExtractor;
@@ -148,6 +151,22 @@ if (packsOnlyIndex >= 0 && packsOnlyIndex + 1 < args.Length &&
     Directory.Exists(args[packsOnlyIndex + 1]))
 {
     installDirectory = Path.GetFullPath(args[packsOnlyIndex + 1]);
+}
+
+// --port-configs-only <dir>: debug switch. Run only the stock-mpv config port
+// (PortConfigsForTarget + GenerateInputConf: the text rewrites and the uosc
+// bundle) over an existing tree holding a portable_config/ and exit. Downloads
+// nothing but uosc, so the port can be exercised without a multi-GB assembly.
+// <dir> is required and overrides the version-derived install directory.
+int portConfigsOnlyIndex = Array.IndexOf(args, "--port-configs-only");
+if (portConfigsOnlyIndex >= 0)
+{
+    if (portConfigsOnlyIndex + 1 >= args.Length ||
+        !Directory.Exists(Path.Combine(args[portConfigsOnlyIndex + 1], "portable_config")))
+    {
+        throw new ArgumentException("--port-configs-only needs a directory containing portable_config/.");
+    }
+    installDirectory = Path.GetFullPath(args[portConfigsOnlyIndex + 1]);
 }
 
 var inferencePath = Path.Combine(installDirectory, "animejanai", "inference");
@@ -1689,11 +1708,22 @@ if (packsOnlyIndex >= 0)
 {
     await EmitComponentPacks();
 }
-else if (Array.IndexOf(args, "--target") < 0 && RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+else if (portConfigsOnlyIndex >= 0)
 {
-    // No explicit --target on a Linux host = the local dev assembly from this
-    // machine's build trees (ROCm/Vulkan backends). CI and release builds pass
-    // --target and always take the release assembler (Main), on any host.
+    await PortConfigsForTarget();
+    GenerateInputConf();
+    Console.WriteLine($"Configs ported for {plat.Rid} at {installDirectory}");
+}
+else if (args.Contains("--local-dev"))
+{
+    // Explicit opt-in to the local dev assembly from this machine's build trees
+    // (ROCm/Vulkan backends; nothing downloaded but 7zz/uosc). Linux host only.
+    // Never implied: with no flag the tool behaves exactly like upstream (host
+    // RID, or --target, -> the release assembler Main), on any host.
+    if (plat.IsWindows || !RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+    {
+        throw new ArgumentException("--local-dev is the Linux-host local assembly; it takes no --target win-x64 and does not run on Windows.");
+    }
     await MainLinux();
 }
 else

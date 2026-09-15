@@ -41,6 +41,7 @@ On Linux the same binary is invoked without the extension:
 
 ```
 BuildMpvUpscale2xAnimeJaNai <version> [--target win-x64|linux-x64] [--packs] [--packs-only [dir]]
+                                      [--local-dev] [--port-configs-only <dir>]
 ```
 
 - **`<version>`** — required, must be the **first** positional arg. `Program.cs` throws
@@ -48,23 +49,42 @@ BuildMpvUpscale2xAnimeJaNai <version> [--target win-x64|linux-x64] [--packs] [--
   `args.Length < 1 || args[0].StartsWith("--")`. It is used only as the install-folder suffix;
   there is no semver parsing.
 - **`--target`** — `win-x64` or `linux-x64`; defaults to the host RID. Anything else throws
-  `Unsupported --target '<rid>' (use win-x64 or linux-x64)`.
+  `Unsupported --target '<rid>' (use win-x64 or linux-x64)`. With no `--target` the tool
+  behaves exactly like upstream: host RID → the release assembler `Main()`, on any host.
 - **`--packs`** — after assembling, emit the component packs (`EmitComponentPacks()`) and then
   **slim the core tree** (`SlimInstallTree(packFiles)`), removing from the install tree what now
   ships as a downloadable pack. This is what CI uses.
 - **`--packs-only [dir]`** — emit packs from an **already-built** tree and exit, skipping the
   whole download/assemble path. If `dir` is given and exists, it overrides the version-derived
-  install directory. **Use this when iterating on packaging** — it is the only cheap mode.
+  install directory. **Use this when iterating on packaging** — it is one of the two cheap modes.
+- **`--local-dev`** — *(`linux-support` branch, Linux host only)* explicit opt-in to the local
+  dev assembly `MainLinux()` instead of `Main()`. It is never implied: without the flag a Linux
+  host builds the same `linux-x64` release tree CI does. Throws when combined with
+  `--target win-x64` or run on a non-Linux host.
+- **`--port-configs-only <dir>`** — debug switch, the other cheap mode: run only the
+  non-Windows config port (`PortConfigsForTarget` + `GenerateInputConf`: the text rewrites, the
+  mpv.net→uosc keybinding port and the uosc bundle) over an existing `<dir>/portable_config/`
+  and exit. Downloads nothing but uosc (~20 MB). `<dir>` is required and must already hold a
+  `portable_config/`; `--target` selects the platform as usual (`win-x64` is a no-op port).
+  Use it to eyeball a ported `input.conf` / `mpv-animejanai.conf` without a multi-GB assembly:
+  ```bash
+  cp -r BuildMpvUpscale2xAnimeJaNai/mpv-upscale-2x_animejanai/portable_config /tmp/porttest/
+  dotnet run --project BuildMpvUpscale2xAnimeJaNai -c Release -- 0.0.0 --target linux-x64 --port-configs-only /tmp/porttest
+  grep -c 'script-message-to mpvnet' /tmp/porttest/portable_config/input.conf   # -> 0
+  ```
 
-> **`linux-support` branch:** on a Linux host with **no `--target`**, the assembler takes the
-> local dev assembly `MainLinux()` instead of `Main()`: it bundles this machine's ROCm/Vulkan
-> build trees (`AJI_LINUX_BUILD_DIR`, `MPV_FORK_BIN`, `NCNN_LINUX_LIB`, `AJI_NCNN_MODELS_DIR`,
+> **`linux-support` branch:** `--local-dev` takes the local dev assembly `MainLinux()`
+> instead of `Main()`: it bundles this machine's ROCm/Vulkan build trees
+> (`AJI_LINUX_BUILD_DIR`, `MPV_FORK_BIN`, `NCNN_LINUX_LIB`, `AJI_NCNN_MODELS_DIR`,
 > `AJI_RIFE_DIR`, `AJI_UPDATER_BIN`, `AJI_CONFEDITOR_DIR`, `AJI_UOSC_DIR`) and downloads nothing
-> but 7zz/uosc. It writes the same `version.txt` + `manifest.json`, and `--packs-only` on that
-> tree emits the extra `rocm` / `vulkan` packs. Those packs exist on no GitHub release, so the
-> updater must be pointed at them with `ANIMEJANAI_PACKS_DIR` (never set
-> `component_package_version` for such a package). Passing `--target` always selects the
-> release assembler, on any host.
+> but 7zz/uosc. It reuses the shared `PortConfigsForTarget` (so the keybinding port and uosc
+> are the same as in the release tree) and layers only its AMD-backend deltas on top. It
+> writes the same `version.txt` + `manifest.json`, and `--packs-only` on that tree emits the
+> extra `rocm` / `vulkan` packs. Those packs exist on no GitHub release, so the updater must
+> be pointed at them with `ANIMEJANAI_PACKS_DIR` (never set `component_package_version` for
+> such a package). Before this flag existed the local assembly was implied by "Linux host, no
+> `--target`" — that is gone; `./publish/BuildMpvUpscale2xAnimeJaNai 3.6.0` on Linux now builds
+> the release tree exactly like `--target linux-x64`.
 
 > **The install directory is deleted first.** `Main()` opens with
 > `if (Directory.Exists(installDirectory)) Directory.Delete(installDirectory, true);`
