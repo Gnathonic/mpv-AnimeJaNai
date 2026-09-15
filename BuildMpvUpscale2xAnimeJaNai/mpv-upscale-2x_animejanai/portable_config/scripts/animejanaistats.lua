@@ -2,16 +2,17 @@
 -- filter rewrites on every reconfigure), the inference backend and video renderer in use,
 -- and playback fps - the instantaneous output rate, a running average since the overlay
 -- was opened (or since the last seek/file change), and dropped frames. Refreshes twice a
--- second while shown.
+-- second while shown. Drawn as its own ASS overlay (not osd_message) so it coexists with
+-- the engine-build monitor's messages instead of flickering against them.
 
 local mp = require 'mp'
 local utils = require 'mp.utils'
 
-local MAX_DURATION = 2147483
 local REFRESH = 0.5
 
 local showing = false
 local timer = nil
+local overlay = mp.create_osd_overlay("ass-events")
 local fps_sum, fps_n = 0, 0
 
 local function read_file(path)
@@ -73,7 +74,7 @@ local function build_message()
     if not chain or chain == "" then
         chain = "Error during upscale; press ~ to view error in console"
     end
-    chain = chain:gsub("%s+$", "")
+    chain = chain:gsub("%s+$", ""):gsub("%s*%[model ", "\n  model "):gsub("; %]$", "")
 
     -- fps: estimated-vf-fps is the rate frames leave the filter chain (the upscaled
     -- output); average it while playing so pauses don't drag it down.
@@ -98,9 +99,14 @@ local function build_message()
     }, "\n")
 end
 
+local function ass_escape(text)
+    return (text:gsub("\\", "\\\\"):gsub("{", "\\{"):gsub("}", "\\}"):gsub("\n", "\\N"))
+end
+
 local function refresh()
     if not showing then return end
-    mp.osd_message(build_message(), MAX_DURATION)
+    overlay.data = "{\\an7\\fs18\\bord1.5\\shad0\\pos(20,150)}" .. ass_escape(build_message())
+    overlay:update()
 end
 
 local function reset_average()
@@ -111,7 +117,7 @@ local function toggle()
     if showing then
         showing = false
         if timer then timer:kill(); timer = nil end
-        mp.osd_message("")
+        overlay:remove()
         return
     end
     showing = true
