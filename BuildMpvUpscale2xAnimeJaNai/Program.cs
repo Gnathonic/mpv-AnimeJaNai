@@ -921,10 +921,13 @@ void WriteVersionAndManifest()
             ort_dml = plat.IsWindows ? $"{OrtDmlVersion}+{DirectMLVersion}" : (string?)null,
             sevenzip = SevenZipVersion,
             rife = RifeModelsVersion,
-            // AMD/portable backend packs (Linux packages only): these version the
-            // 'rocm'/'vulkan' component packs for the skip-if-unchanged check.
-            rocm = plat.IsWindows ? (string?)null : RocmBackendVersion,
-            vulkan = plat.IsWindows ? (string?)null : VulkanBackendVersion,
+            // AMD/portable backend packs: these version the 'rocm'/'vulkan'
+            // component packs for the updater's skip-if-unchanged / stale checks.
+            // Keyed on the backend actually being in the tree (the same presence
+            // test EmitComponentPacks uses), so a --target linux-x64 release tree
+            // without the AMD stack advertises no dep for a pack it never emits.
+            rocm = File.Exists(Path.Combine(inferencePath, "libaji_rocm.so")) ? RocmBackendVersion : (string?)null,
+            vulkan = File.Exists(Path.Combine(inferencePath, "libaji_vk.so")) ? VulkanBackendVersion : (string?)null,
         },
         overlay_paths = overlayPaths.ToArray(),
         // User data never overwritten by an update (full updates preserve these explicitly).

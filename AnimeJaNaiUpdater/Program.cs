@@ -1087,6 +1087,13 @@ List<string> RecommendedPacks(PackIndex index, bool hasNvidia, string sm)
     return rec;
 }
 
+// What covers a non-NVIDIA GPU on this platform: DirectML ships in the Windows
+// core; on Linux the AMD ROCm pack and/or the vendor-neutral Vulkan pack do.
+string NonNvidiaLabel() =>
+    OperatingSystem.IsWindows() ? "DirectML (in the core install) covers AMD/Intel"
+    : DetectAmd() ? "AMD GPU - ROCm/Vulkan packs recommended"
+    : "Vulkan pack covers AMD/Intel";
+
 // AMD detection (Linux): amdgpu sysfs vendor id 0x1002. NVML-style probing has
 // no AMD equivalent that ships with the driver, and this needs no tools.
 static bool DetectAmd()
@@ -1151,7 +1158,7 @@ async Task ComponentsAsync(PackIndex? prefetched, bool json = false)
     }
     Console.WriteLine(hasNvidia
         ? $"GPU: {gpu} ({sm}) - TensorRT recommended"
-        : "GPU: no NVIDIA device detected - DirectML (in the core install) covers AMD/Intel");
+        : $"GPU: no NVIDIA device detected - {NonNvidiaLabel()}");
     Console.WriteLine($"Recommended packs: {string.Join(", ", rec)}");
     Console.WriteLine();
     foreach (var pack in index.Packs)
@@ -1291,7 +1298,7 @@ async Task<int> AutoComponentsAsync()
         await ComponentsAsync(index, false);
         return 0;
     }
-    Console.WriteLine($"Installing for {(hasNvidia ? gpu : "DirectML-class GPU")}: {string.Join(", ", missing)}");
+    Console.WriteLine($"Installing for {(hasNvidia ? gpu : NonNvidiaLabel())}: {string.Join(", ", missing)}");
     foreach (var name in missing)
     {
         int rc = await InstallComponentAsync(name);

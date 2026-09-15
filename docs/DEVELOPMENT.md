@@ -56,6 +56,16 @@ BuildMpvUpscale2xAnimeJaNai <version> [--target win-x64|linux-x64] [--packs] [--
   whole download/assemble path. If `dir` is given and exists, it overrides the version-derived
   install directory. **Use this when iterating on packaging** — it is the only cheap mode.
 
+> **`linux-support` branch:** on a Linux host with **no `--target`**, the assembler takes the
+> local dev assembly `MainLinux()` instead of `Main()`: it bundles this machine's ROCm/Vulkan
+> build trees (`AJI_LINUX_BUILD_DIR`, `MPV_FORK_BIN`, `NCNN_LINUX_LIB`, `AJI_NCNN_MODELS_DIR`,
+> `AJI_RIFE_DIR`, `AJI_UPDATER_BIN`, `AJI_CONFEDITOR_DIR`, `AJI_UOSC_DIR`) and downloads nothing
+> but 7zz/uosc. It writes the same `version.txt` + `manifest.json`, and `--packs-only` on that
+> tree emits the extra `rocm` / `vulkan` packs. Those packs exist on no GitHub release, so the
+> updater must be pointed at them with `ANIMEJANAI_PACKS_DIR` (never set
+> `component_package_version` for such a package). Passing `--target` always selects the
+> release assembler, on any host.
+
 > **The install directory is deleted first.** `Main()` opens with
 > `if (Directory.Exists(installDirectory)) Directory.Delete(installDirectory, true);`
 > A full run downloads several GB and takes minutes.
