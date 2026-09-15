@@ -2,6 +2,22 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Documentation map
+
+This file is the orientation doc: what the repo is, how the runtime fits together, and the
+conventions. The step-by-step procedures live next to it:
+
+- **[`docs/DEVELOPMENT.md`](docs/DEVELOPMENT.md)** — local dev loop: prerequisites, building
+  and running the assembler, the env-var overrides that swap in a locally built component
+  instead of downloading it, and the repo's gotchas.
+- **[`docs/RELEASE.md`](docs/RELEASE.md)** — the cross-repo release runbook: which sibling
+  workflow to dispatch in which order, which constant consumes each tag, and the full asset map.
+
+Sibling components are documented in their own repos: `the-database/mpv` (`CLAUDE.md` +
+`DOCS/animejanai-build-local.md` + `DOCS/animejanai-build-ci.md`), `the-database/libass`, `the-database/mpv-winbuild`,
+`the-database/animejanai-inference` (`docs/BUILD-WINDOWS.md` + `docs/BUILD-LINUX.md`), and
+`the-database/AnimeJaNaiManager`.
+
 ## What this repo is
 
 This repo does **not** contain the mpv player, the `vf_animejanai` mpv filter, the `aji` inference
@@ -10,8 +26,11 @@ It contains:
 
 1. **`BuildMpvUpscale2xAnimeJaNai/`** — a C# console app (`Program.cs`, top-level statements) whose
    only job is to download the pieces and assemble them: mpv.net, a custom **libmpv fork** (carries
-   the `vf_animejanai` filter), the **`aji` native inference shim** (`aji.dll` + `aji_trt.dll` /
-   `aji_dml.dll`), the **TensorRT runtime + `trtexec`** (lifted from the vs-mlrt cuda archive),
+   the `vf_animejanai` filter; from mpv-winbuild's *dev* archive) plus the matching **standalone
+   `mpv.exe`** (from the same release's *player* archive — a self-contained static build with the
+   filter compiled in, shipped next to `mpvnet.exe` for users who prefer plain mpv; it auto-detects
+   the same `portable_config/`), the **`aji` native inference shim** (`aji.dll` + `aji_trt.dll` /
+   `aji_dml.dll`), the **TensorRT runtime + `trtexec`** (from NVIDIA's own redistributable download),
    **ONNX Runtime DirectML + `DirectML.dll`**, RIFE models, `yt-dlp`, the AnimeJaNai Manager, and
    the AnimeJaNaiUpdater — then layers the runtime files in
    `BuildMpvUpscale2xAnimeJaNai/mpv-upscale-2x_animejanai/` on top to produce the redistributable
@@ -39,10 +58,18 @@ libmpv fork and the aji release and bump **both** `MpvForkVersion` and `AjiVersi
 
 ## Platform support (read before adding tooling)
 
-The distribution is **Windows-only today** (it bundles mpv.net, a Windows libmpv fork, the
-vsmlrt-cuda Windows binaries, and the Windows `aji` / ONNX-Runtime / DirectML DLLs). **Linux builds
-are on the roadmap**, so when adding or changing build/runtime tooling, avoid baking in Windows-only
-assumptions where keeping it portable is cheap:
+**Both Windows and Linux ship.** The assembler takes `--target win-x64|linux-x64`
+(`SelectTarget`, `Program.cs`), `deploy.yml` has a `deploy-linux` job, and releases since
+3.5.0 carry `-linux-x64` assets plus an AppImage and a `tar.zst` alongside the Windows Setup
+exe and 7z package. The per-platform names/paths are centralised in the `Platform` descriptor
+at the bottom of `Program.cs`.
+
+Windows-only pieces (no Linux equivalent installed): mpv.net, and the DirectML backend
+(`aji_dml.dll`, ONNX Runtime DirectML, `DirectML.dll` — `HasDirectML = false` on Linux).
+Linux gets its mpv bundle from a `the-database/mpv` release; both platforms fetch the
+TensorRT runtime straight from NVIDIA (the Windows zip, the Linux `.deb`s).
+
+When adding or changing build/runtime tooling, keep it portable:
 
 - Prefer cross-platform languages/runtimes already in use (.NET cross-compiles to `linux-x64`;
   mpv/Lua run on Linux; the `aji` engine and the filter are portable C/C++). Do **not** introduce a
@@ -51,8 +78,9 @@ assumptions where keeping it portable is cheap:
 - Drive platform-specific names/paths (player executable, archive tool, exe suffix, etc.) from data
   like `manifest.json` rather than hardcoding `mpvnet.exe` / `7z.exe` / `.exe`. The updater
   (`AnimeJaNaiUpdater/`) already does this as the reference pattern.
-- It's fine to ship Windows-only for now and defer the actual Linux build/packaging — just don't
-  design something that *can't* extend to Linux without a rewrite.
+- A new component must land on both legs. `PortConfigsForTarget()` rewrites the config paths
+  for Linux (`aji.dll`→`libaji.so`, `trtexec.exe`→`trtexec`, `'Segoe UI'`→`'sans-serif'`); add
+  to it rather than forking the config files.
 
 ## Building and releasing
 
@@ -72,13 +100,17 @@ to decide overlay-vs-full updates (`overlay_paths` = files an in-place update ov
 `user_preserve` = what it keeps).
 
 The download/version pins are constants at the top of `Program.cs` (`AjiVersion`, `MpvForkVersion`,
-`VsMlrtCudaVersion`, `OrtDmlVersion`, `DirectMLVersion`, `RifeModelsVersion`, `MpvNetVersion`,
+`TrtVersion`, `TrtCudaVersion`, `OrtDmlVersion`, `DirectMLVersion`, `RifeModelsVersion`, `MpvNetVersion`,
 `ManagerVersion`). Bumping a component = bump its constant.
 
-The csproj targets **net10.0**, but `.github/workflows/deploy.yml` pins `dotnet-version: '8.x'` —
-keep this in mind if the workflow fails after a TFM bump.
+All three csproj target **net10.0**, and `.github/workflows/deploy.yml` pins
+`dotnet-version: '10.x'` in both legs — keep them in sync after a TFM bump. There is no
+`global.json`.
 
 There is no test suite and no linter configured.
+
+See `docs/DEVELOPMENT.md` for the full assembler CLI (`--target`, `--packs`, `--packs-only`)
+and the local-component override env vars, and `docs/RELEASE.md` for the release runbook.
 
 ## Benchmarks
 
@@ -134,6 +166,18 @@ filter calling the `aji` engine. The chain when a user plays a video:
    backend on startup. (`ncnn` is retired and treated as DirectML by the shim.)
 7. **RIFE** interpolation runs after upscaling by default, or before it when a chain sets
    `rife_before_upscale`; RIFE model files live in `animejanai/rife/` (downloaded by `InstallRife()`).
+8. **Subtitle rendering** has two managed presets in `portable_config/mpv-animejanai.conf`: the
+   stable defaults inside `[animejanai]` (every GPU/threaded subtitle feature of the fork off —
+   note `sub-ass-render-threads=1` and `sub-present-guard-ms=0` are the *off* values; `0` and `-1`
+   mean auto/armed) and the opt-in `[subs-gpu]` profile (GPU glyph raster + blur, render-ahead
+   worker, OSD render cap, persistent stats overlay). The Manager's "GPU Subtitle Rendering"
+   checkbox writes `[global] sub_render_mode=gpu`, and `scripts/animejanai_backend.lua` applies
+   the profile at startup. Keep the option list in the profile, not in the Lua or the Manager.
+   The script applies each option **only while it still holds the managed default** (read from
+   `profile-list`, falling back to `option-info/<key>/default-value`) — scripts run after the
+   config is parsed, so a blanket `apply-profile` would override the user's own `mpv.conf` lines
+   and break the "your settings win" contract that `mpv.conf` and `mpv-animejanai.conf` promise.
+   Any future script-applied preset must follow the same rule.
 
 ### Config (`animejanai.conf`)
 
@@ -146,6 +190,10 @@ The `aji` engine parses `animejanai.conf` (the old Python `animejanai_config.rea
 - **User slots `1`–`9`** are parsed from `animejanai.conf` (`[slot_N]`,
   `chain_<n>_model_<m>_<field>` keys, `[global]` settings like `backend=`). The AnimeJaNai Manager
   writes this file.
+- **Player-only `[global]` keys.** `default_slot` and `sub_render_mode` are written by the Manager
+  and read by the Lua scripts, not by the engine (`aji_conf.cpp` looks up only the keys it knows, so
+  unknown ones are ignored). This is the pattern for any future "Manager configures mpv" setting:
+  a `[global]` key here, the actual mpv options in a managed profile.
 
 ### Stats overlay
 

@@ -340,20 +340,22 @@ void SyncInputConf()
         {
             var binds = File.ReadAllLines(userConf)
                 .Where(l => l.Trim().Length > 0 && !l.TrimStart().StartsWith("#")).ToList();
-            if (binds.Count > 0)
+            const string migrationMarker = "# Migrated from input-user.conf (retired in 3.4.0):";
+            int previous = userSection.LastIndexOf(migrationMarker);
+            bool alreadyMigrated = previous >= 0 &&
+                userSection.Skip(previous + 1).Take(binds.Count).SequenceEqual(binds);
+            if (binds.Count > 0 && !alreadyMigrated)
             {
                 userSection.Add("");
-                userSection.Add("# Migrated from input-user.conf (retired in 3.4.0):");
+                userSection.Add(migrationMarker);
                 userSection.AddRange(binds);
             }
-            try { File.Delete(userConf); } catch { }
             migrated = true;
         }
-        // The loader script that applied input-user.conf is no longer needed.
-        try { File.Delete(Path.Combine(pc, "scripts", "animejanai_userinput.lua")); } catch { }
 
         if (currentBlock == newBlock && !migrated)
         {
+            try { File.Delete(Path.Combine(pc, "scripts", "animejanai_userinput.lua")); } catch { }
             return;  // block already current and nothing to migrate
         }
 
@@ -362,12 +364,33 @@ void SyncInputConf()
         rebuilt.AddRange(newBlock.Split('\n'));
         rebuilt.Add(lines[end]);                         // the END marker line
         rebuilt.AddRange(userSection);
-        File.WriteAllText(inputConf, string.Join(nl, rebuilt));
+        // Keep the old bindings and loader until the replacement is on disk.
+        // Writing beside the destination also avoids truncating it on failure.
+        string pending = inputConf + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            File.WriteAllText(pending, string.Join(nl, rebuilt));
+            File.Move(pending, inputConf, overwrite: true);
+        }
+        finally
+        {
+            try { File.Delete(pending); } catch { }
+        }
+        if (migrated)
+        {
+            try { File.Delete(userConf); } catch { }
+        }
+        try { File.Delete(Path.Combine(pc, "scripts", "animejanai_userinput.lua")); } catch { }
         Console.WriteLine(migrated
-            ? "INPUT_CONF_SYNCED (managed block refreshed; input-user.conf folded in and retired)"
+            ? File.Exists(userConf)
+                ? "INPUT_CONF_SYNCED (bindings migrated; input-user.conf retirement will be retried)"
+                : "INPUT_CONF_SYNCED (managed block refreshed; input-user.conf folded in and retired)"
             : "INPUT_CONF_SYNCED (managed keybindings block refreshed)");
     }
-    catch { /* must never break --check */ }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"INPUT_CONF_SYNC_FAILED (original bindings retained): {ex.Message}");
+    }
 }
 
 // The SD model was re-exported at ONNX opset 21 (the op23 build fell back to the
@@ -754,11 +777,29 @@ string ReadLocalVersion()
     return File.Exists(path) ? File.ReadAllText(path).Trim() : "0.0.0";
 }
 
-async Task<Release> GetLatestReleaseAsync()
+Task<Release> GetLatestReleaseAsync() => GetReleaseAsync(apiLatest);
+
+// A test/core-only package may reuse an explicitly pinned component release
+// when its inference/runtime/model dependencies are unchanged. Normal packages
+// omit this field and resolve components against their own installed version.
+string ReadComponentVersion() => ReadManifestString(
+    localManifest, "component_package_version", ReadLocalVersion()).Trim();
+
+Task<Release> GetInstalledReleaseAsync()
 {
-    using var client = new HttpClient();
-    client.DefaultRequestHeaders.UserAgent.ParseAdd("AnimeJaNaiUpdater");
-    string json = await client.GetStringAsync(apiLatest);
+    string tag = ReadComponentVersion();
+    if (string.IsNullOrWhiteSpace(tag) || tag == "0.0.0")
+    {
+        throw new InvalidOperationException(
+            "Cannot select component packs: the installed component version is missing or empty.");
+    }
+    return GetReleaseAsync($"https://api.github.com/repos/{Repo}/releases/tags/{Uri.EscapeDataString(tag)}");
+}
+
+async Task<Release> GetReleaseAsync(string url)
+{
+    using var client = NewClient();
+    string json = await client.GetStringAsync(url);
     using var doc = JsonDocument.Parse(json);
     var root = doc.RootElement;
     string tag = root.GetProperty("tag_name").GetString() ?? "";
@@ -870,7 +911,9 @@ async Task<PackIndex> GetPackIndexAsync()
     }
     else
     {
-        var release = await GetLatestReleaseAsync();
+        // Packs must match this installation, including prereleases and older
+        // versions. The latest endpoint is only for updating the application.
+        var release = await GetInstalledReleaseAsync();
         // packs index is RID-suffixed on Linux (packs-linux-x64.json) so it can
         // coexist with the Windows packs.json on a shared release; its "asset"
         // fields already carry the matching component-*-<rid>.7z names.
@@ -878,7 +921,7 @@ async Task<PackIndex> GetPackIndexAsync()
         var idx = release.Assets.FirstOrDefault(a => a.Name == packsName)
             ?? release.Assets.FirstOrDefault(a => a.Name == "packs.json")
             ?? throw new InvalidOperationException(
-                "The latest release publishes no component packs (packs.json missing).");
+                $"Release {release.Tag} publishes no component packs (packs.json missing).");
         using var client = NewClient();
         json = await client.GetStringAsync(idx.Url);
         assets = release.Assets;
@@ -897,11 +940,45 @@ async Task<PackIndex> GetPackIndexAsync()
             assets.FirstOrDefault(a => a.Name == asset)?.Url,
             e.GetProperty("bytes").GetInt64(),
             files,
-            e.TryGetProperty("dep", out var d) ? d.GetString() : null));
+            e.TryGetProperty("dep", out var d) ? d.GetString() : null,
+            e.TryGetProperty("installed_bytes", out var ib) ? ib.GetInt64() : 0));
     }
     return new PackIndex(
         doc.RootElement.TryGetProperty("package_version", out var v)
             ? v.GetString() ?? "" : "", packs);
+}
+
+// Does the pack's content on disk actually match the published pack? components.json records only
+// what the updater BELIEVES it installed, and that record can be wrong - e.g. a component whose
+// download was skipped or failed while the record was still written, leaving the previous release's
+// files in place. That state is self-perpetuating: the record then says "current" forever and the
+// real files are never refreshed (this is how a TensorRT 11.0 runtime survived an upgrade to a
+// package built for 11.1). Comparing the total extracted size against the index catches it - a
+// different upstream build is a different size - and costs only a directory stat.
+// Older indexes carry no installed_bytes; there is nothing to verify against, so trust the record.
+bool PackContentMatches(Pack pack)
+{
+    if (pack.InstalledBytes <= 0)
+    {
+        return true;
+    }
+    long actual = 0;
+    foreach (var f in pack.Files)
+    {
+        var fi = new FileInfo(Path.Combine(installDir, f));
+        if (!fi.Exists)
+        {
+            return false;
+        }
+        actual += fi.Length;
+    }
+    if (actual != pack.InstalledBytes)
+    {
+        Console.WriteLine($"{pack.Name}: on-disk content does not match the published pack " +
+                          $"({actual:N0} vs {pack.InstalledBytes:N0} bytes); reinstalling.");
+        return false;
+    }
+    return true;
 }
 
 // Installed state: components.json, else inferred from what's on disk so
@@ -944,9 +1021,9 @@ void WriteInstalledComponents(Dictionary<string, string> installed)
 
 string? PackVersionMismatch(PackIndex index)
 {
-    string localVersion = ReadManifestString(localManifest, "package_version", "");
+    string localVersion = ReadComponentVersion();
     return localVersion != "" && index.PackageVersion != "" && localVersion != index.PackageVersion
-        ? $"Installed package is v{localVersion} but the published packs are for v{index.PackageVersion}."
+        ? $"This installation selects component release v{localVersion} but the published packs are for v{index.PackageVersion}."
         : null;
 }
 
@@ -1103,7 +1180,7 @@ async Task<int> InstallComponentAsync(string name)
     }
     if (pack.Url is null)
     {
-        Console.WriteLine($"Pack '{name}' has no downloadable asset on the latest release.");
+        Console.WriteLine($"Pack '{name}' has no downloadable asset on the selected release.");
         return 1;
     }
     if (PackVersionMismatch(index) is string warn)
@@ -1126,7 +1203,7 @@ async Task<int> InstallComponentAsync(string name)
     string target = pack.Dep is null ? "" : ReadManifestDep(localManifest, pack.Dep);
     bool filesPresent = pack.Files.Count > 0 &&
         pack.Files.All(f => File.Exists(Path.Combine(installDir, f)));
-    if (filesPresent && target != "")
+    if (filesPresent && target != "" && PackContentMatches(pack))
     {
         string prev = pack.Dep is null ? "" :
             ReadManifestDep(Path.Combine(installDir, "manifest.prev.json"), pack.Dep);
@@ -1197,8 +1274,16 @@ async Task<int> AutoComponentsAsync()
     var (hasNvidia, sm, gpu) = DetectGpu();
     var rec = RecommendedPacks(index, hasNvidia, sm);
     var installed = ReadInstalledComponents(index);
+    // "Needs installing" is not just "absent": a pack already recorded as installed is stale when
+    // the dep that governs it moved (a TensorRT/RIFE bump) or when its files on disk are not this
+    // pack's content. Without this, --auto reports "everything is installed" after an upgrade and
+    // the old runtime is kept forever; InstallComponentAsync re-checks and still skips genuine no-ops.
     var missing = index.Packs
-        .Where(p => PreselectPack(p, installed, rec) && !installed.ContainsKey(p.Name))
+        .Where(p => PreselectPack(p, installed, rec))
+        .Where(p => !installed.TryGetValue(p.Name, out var recorded) ||
+                    (p.Dep is not null && ReadManifestDep(localManifest, p.Dep) is string t &&
+                     t != "" && recorded != t) ||
+                    !PackContentMatches(p))
         .Select(p => p.Name).ToList();
     if (missing.Count == 0)
     {
@@ -1273,5 +1358,9 @@ static class Nvml
 
 record Release(string Tag, List<Asset> Assets);
 record Asset(string Name, string Url);
-record Pack(string Name, string Asset, string? Url, long Bytes, List<string> Files, string? Dep);
+// InstalledBytes: the pack's total size once extracted (sum of its files on disk). Used to verify
+// that what is on disk really is this pack's content, since components.json bookkeeping alone can
+// be wrong. 0 when the index predates the field (older release) - verification is then skipped.
+record Pack(string Name, string Asset, string? Url, long Bytes, List<string> Files, string? Dep,
+            long InstalledBytes = 0);
 record PackIndex(string PackageVersion, List<Pack> Packs);

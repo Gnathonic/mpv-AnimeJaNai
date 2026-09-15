@@ -17,23 +17,60 @@ using ICSharpCode.SharpZipLib.Zip;
 using SevenZipExtractor;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using static Downloader;
 
 // Third-party component versions. Bump these together when cutting a release.
-// The inference runtime (TensorRT + trtexec) is reused from the vs-mlrt cuda
-// release archives on Windows; publicly downloadable, license-precedented, and
-// trtexec is version-matched to nvinfer by construction. aji_trt must be built
-// against the SAME TensorRT major.minor (v16.x == TensorRT 11.0).
-// NOTE: v16.test1 is vs-mlrt's TRT 11 PRE-release - recheck for a stable
-// v16 tag before cutting the package release.
-const string VsMlrtCudaVersion    = "v16.test1";
-const string AjiVersion           = "v0.7.0";       // github.com/the-database/animejanai-inference release tag (DML 4:4:4 input; op21 SD preset; missing-model passthrough; configurable RIFE/upscale order; benchmark slots 1012/1013)
+//
+// The inference runtime (TensorRT + trtexec) comes straight from NVIDIA's
+// public download - no login, no third-party redistributor. The "-external"
+// zip is the publicly redistributable build and carries everything: the
+// runtime DLLs, every per-SM builder resource, a prebuilt trtexec.exe, the
+// headers + import libs that animejanai-inference builds against, and
+// doc/Acknowledgements.txt. NVIDIA does not rotate old versions (10.13.3.9
+// through 11.3.0.99 are all still live), so old releases stay buildable.
+//
+// Should a URL ever 404, two archival fallbacks carry the same bits:
+// pypi.nvidia.com/tensorrt-cu13-libs/ (all versions, sha256 in the index, but
+// no trtexec) and the CUDA apt repo (including trtexec via libnvinfer-bin).
+//
+// TrtCudaVersion is its own pin, NOT derivable from TrtVersion: the pairing
+// varies per release (11.0 -> 13.2, 11.1 -> 13.3, 11.2 -> 13.3, 11.3 -> 13.4).
+//
+// aji_trt must be built against the SAME TensorRT major.minor it runs on, so
+// bump AjiVersion alongside this.
+const string TrtVersion           = "11.3.0.99";
+const string TrtCudaVersion       = "13.4";
+// NVIDIA publishes no checksum beside the zip, so this is recorded from a
+// verified download and enforced on every build afterwards.
+const string TrtSha256Win         = "8ffd112d7bab97bc81eed818358b85df8c317bcdfc3cd3c731c220df7ca737eb";
 
-const string SevenZipVersion      = "2501";         // 7-zip "extra" (Windows) / linux-x64 standalone console version
+// CUDA runtime (cudart64_13.dll), from NVIDIA's CUDA redistributable archive.
+// Version + hash come from the public manifest, which does publish per-file
+// checksums: developer.download.nvidia.com/compute/cuda/redist/redistrib_13.4.1.json
+const string CudartVersion        = "13.4.49";
+const string CudartSha256Win      = "e6663f3d3e8949eedc2d5ab92c7c5b9fa3f2a222086d91c42bfc5a38bf2b0225";
+const string CudartSha256Linux    = "ec3df9f91560db23a064c6b395d4fde17b2893f5bf954c6bd193dd03a44de522";
+
+// Linux takes TensorRT from NVIDIA's apt packages, fetched straight from the
+// CUDA repo pool (no apt, no container dependency). Unlike the Windows zip,
+// the repo's Packages index publishes a SHA-256 per file, so these are
+// NVIDIA's own checksums rather than trust-on-first-use.
+const string CudaAptRepo          = "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64";
+var trtDebSha256 = new Dictionary<string, string>
+{
+    ["libnvinfer11"]        = "f7685ff32593519c1929ac5412ebc1eb24f7698fd0ed2b2e5fd883ebdaa5fb31",
+    ["libnvinfer-plugin11"] = "4c23aab86ec4b67b7e4d5fdce317a5a61e137128102bee78d5233821dbdd1b27",
+    ["libnvonnxparsers11"]  = "059864bcf6eb95647d775e5b8b4e3f5a93a742c212f1f857c41688d2d81a5b01",
+    ["libnvinfer-bin"]      = "e8268620847063fc0c41567c8d4b722c7a6e90e25be9a9b3462041f2b4897e9c",
+};
+const string AjiVersion           = "v0.9.0";       // github.com/the-database/animejanai-inference release tag (built against TensorRT 11.3; spawns trtexec via CreateProcessW so non-ASCII install paths survive, and the harnesses get the UTF-8 argv manifest)
+
+const string SevenZipVersion      = "2602";         // 7-zip "extra" (Windows) / linux-x64 standalone console version
 const string MpvNetVersion        = "v7.1.2.0";
-const string ManagerVersion       = "0.4.0";        // github.com/the-database/AnimeJaNaiManager release tag (AnimeJaNai Manager)
+const string ManagerVersion       = "0.6.0";        // github.com/the-database/AnimeJaNaiManager release tag (AnimeJaNai Manager; preserves the RIFE ensemble flag across profile export/import)
 
 // DirectML backend runtime (backend=DirectML in animejanai.conf). These are
 // the last DirectML-flavored releases: Microsoft moved DML to sustained
@@ -52,12 +89,15 @@ const string RifeModelsVersion    = "models-rife-fp16-1"; // animejanai-inferenc
 // IMPORTANT: the filter now lives on the mpv fork's `master` branch (aji ABI
 // v8); the old standalone `vf-animejanai` branch is stale (ABI v4) and must
 // NOT be used. The pin below is a master commit.
-const string MpvForkVersion       = "2026-06-20-b903de7812"; // release tag (Windows winbuild)
-const string MpvForkBuildDate     = "20260620";     // build date in the Windows dev archive filename
-const string MpvForkGitHash       = "b903de7812";   // git short hash (master; aji ABI v8)
+const string MpvForkVersion       = "2026-09-13-d4c06dd342"; // release tag (Windows winbuild)
+const string MpvForkBuildDate     = "20260913";     // build date in the Windows dev archive filename
+const string MpvForkGitHash       = "d4c06dd342";   // git short hash (master; aji ABI v8)
 // Linux mpv bundle: a github.com/the-database/mpv release asset (tar.zst).
 // Overridable via MPV_LINUX_LOCAL (a local meson build dir, e.g. ~/src/mpv/build).
-const string MpvForkLinuxVersion  = "2026-06-20-b903de7";
+// NOTE: this is a *different* master commit than the Windows pin above (e88bd2c
+// is one upstream-merge commit ahead of d4c06dd342) - the two release workflows
+// were dispatched minutes apart. vf_animejanai/aji.h are identical in both.
+const string MpvForkLinuxVersion  = "2026-10-13-e88bd2c";
 // Local AMD-backend builds (animejanai-inference, branch linux-vulkan-backend).
 // Bump when the pack contents change: these version the 'rocm'/'vulkan' manifest
 // deps keys that gate the updater's skip-if-unchanged component check.
@@ -106,9 +146,9 @@ var inferencePath = Path.Combine(installDirectory, "animejanai", "inference");
 var onnxPath = Path.Combine(installDirectory, "animejanai", "onnx");
 var rifePath = Path.Combine(installDirectory, "animejanai", "rife");
 
-// Standalone 7-Zip console: used here to extract the multi-part vs-mlrt archive
-// (Windows), and shipped at the install root for the updater (manifest
-// archive_tool). 7za.exe on Windows, 7zz on Linux.
+// Standalone 7-Zip console: used here to build the component packs
+// (EmitComponentPacks), and shipped at the install root for the updater
+// (manifest archive_tool). 7za.exe on Windows, 7zz on Linux.
 async Task InstallSevenZip()
 {
     Console.WriteLine("Downloading 7-Zip standalone console...");
@@ -158,74 +198,86 @@ async Task InstallInferenceRuntime()
     Directory.CreateDirectory(inferencePath);
     if (plat.IsWindows)
     {
-        Console.WriteLine("Downloading TensorRT runtime (from the vs-mlrt cuda release)...");
-        var baseDownloadUrl = $"https://github.com/AmusementClub/vs-mlrt/releases/download/{VsMlrtCudaVersion}/";
-        var fileNames = new[]
+        // NVIDIA's "-external" zip. Only bin/ ships: the headers, import libs,
+        // cmake/ and python/ in the same archive are build-time material for
+        // animejanai-inference, not runtime files.
+        var trtDir = string.Join('.', TrtVersion.Split('.').Take(3));
+        var asset = $"TensorRT-Enterprise-{TrtVersion}-Windows-amd64-cuda-{TrtCudaVersion}-Release-external.zip";
+        var downloadUrl = $"https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/{trtDir}/zip/{asset}";
+
+        // TRT_LOCAL_ZIP reuses an already-downloaded archive; without it every
+        // local assembly re-fetches ~2 GB. Same shape as AJI_LOCAL_ZIP.
+        var localZip = Environment.GetEnvironmentVariable("TRT_LOCAL_ZIP");
+        string targetPath;
+        bool temp = false;
+        if (!string.IsNullOrEmpty(localZip))
         {
-            $"vsmlrt-windows-x64-cuda.{VsMlrtCudaVersion}.7z.001",
-            $"vsmlrt-windows-x64-cuda.{VsMlrtCudaVersion}.7z.002",
-        };
-        var targetPaths = fileNames.Select(f => Path.GetFullPath(f)).ToArray();
-
-        double lastProgress = -1;
-        int updateThreshold = 5;
-
-        for (int i = 0; i < fileNames.Length; i++)
+            Console.WriteLine($"Using local TensorRT archive: {localZip}");
+            targetPath = localZip;
+        }
+        else
         {
-            string downloadUrl = baseDownloadUrl + fileNames[i];
-            string targetPath = targetPaths[i];
-
+            Console.WriteLine($"Downloading TensorRT {TrtVersion} (CUDA {TrtCudaVersion}) from NVIDIA...");
+            targetPath = Path.GetFullPath(asset);
+            temp = true;
+            double lastProgress = -1;
             await DownloadFileAsync(downloadUrl, targetPath, (progress) =>
             {
-                if (progress >= lastProgress + updateThreshold)
+                if (progress >= lastProgress + 5)
                 {
-                    Console.WriteLine($"Downloading {fileNames[i]} ({progress}%)...");
+                    Console.WriteLine($"Downloading TensorRT ({progress}%)...");
                     lastProgress = progress;
                 }
             });
         }
+        VerifySha256(targetPath, TrtSha256Win);
 
-        Console.WriteLine("Extracting TensorRT runtime (this may take several minutes)...");
-        var tempDirectory = Path.GetFullPath("vsmlrt-temp");
-        Directory.CreateDirectory(tempDirectory);
-
-        // Only vsmlrt-cuda/ is needed (a flat directory); extracting just that
-        // subtree also skips the plugin DLLs (vstrt/vsort/...) entirely.
-        await RunProcess(Path.Combine(installDirectory, plat.ArchiveTool),
-                         $"x \"{targetPaths[0]}\" -o\"{tempDirectory}\" \"vsmlrt-cuda\\*\" -r- -y");
-
-        var cudaDirectory = Path.Combine(tempDirectory, "vsmlrt-cuda");
-        foreach (var file in Directory.GetFiles(cudaDirectory))
+        Console.WriteLine("Extracting TensorRT runtime...");
+        ExtractZipFiltered(targetPath, entry =>
         {
-            var name = Path.GetFileName(file);
-            bool keep = plat.InferenceRuntimeFiles.Contains(name) ||
-                        plat.InferenceRuntimePrefixes.Any(p => name.StartsWith(p, StringComparison.OrdinalIgnoreCase)) ||
-                        name.Contains("LICENSE", StringComparison.OrdinalIgnoreCase);
-            if (keep)
-            {
-                File.Copy(file, Path.Combine(inferencePath, name), true);
-            }
-        }
+            var name = Path.GetFileName(entry);
+            if (entry.Contains("/bin/", StringComparison.Ordinal) && KeepInferenceFile(name))
+                return Path.Combine(inferencePath, name);
+            // NVIDIA's own attribution file, kept beside the binaries it covers.
+            if (name.Equals("Acknowledgements.txt", StringComparison.OrdinalIgnoreCase))
+                return Path.Combine(inferencePath, "TensorRT_Acknowledgements.txt");
+            return null;
+        });
 
-        Directory.Delete(tempDirectory, true);
-        foreach (var targetPath in targetPaths)
+        if (temp)
         {
             File.Delete(targetPath);
         }
+
+        await InstallCudart();
     }
     else
     {
-        // Linux: vs-mlrt publishes no Linux build, so the TensorRT runtime is
-        // taken from an NVIDIA TensorRT install (the apt packages' userland
-        // layout). Copy the .so set + trtexec from TRT_LINUX_ROOT (default
-        // /usr) and cudart from CUDA_LINUX_LIB (default the cuda toolkit lib).
-        // The per-SM builder resources (libnvinfer_builder_resource_sm*.so) feed
-        // the same per-GPU component-pack split as on Windows.
-        var trtRoot = Environment.GetEnvironmentVariable("TRT_LINUX_ROOT") ?? "/usr";
+        // Linux: TensorRT comes from NVIDIA's apt packages. With no override the
+        // .debs are fetched from the CUDA repo pool and unpacked here, which
+        // reproduces the standard /usr layout -- so the harvesting below is
+        // identical whether the tree came from a download or from a system
+        // install. TRT_LINUX_ROOT still points at an existing install (a dev
+        // box, or a build image that already carries TensorRT); CUDA_LINUX_LIB
+        // does the same for cudart. The per-SM builder resources
+        // (libnvinfer_builder_resource_sm*.so) feed the same per-GPU
+        // component-pack split as on Windows.
+        var trtRoot = Environment.GetEnvironmentVariable("TRT_LINUX_ROOT");
+        var cudaLib = Environment.GetEnvironmentVariable("CUDA_LINUX_LIB");
+        var downloadRoot = Path.GetFullPath("trt-linux-root");
+
+        if (string.IsNullOrEmpty(trtRoot))
+        {
+            await InstallTrtDebs(downloadRoot);
+            trtRoot = Path.Combine(downloadRoot, "usr");
+        }
+        if (string.IsNullOrEmpty(cudaLib))
+        {
+            cudaLib = await InstallCudartLinux(downloadRoot);
+        }
+
         var trtLib = Path.Combine(trtRoot, "lib", "x86_64-linux-gnu");
         var trtBin = Path.Combine(trtRoot, "bin");
-        var cudaLib = Environment.GetEnvironmentVariable("CUDA_LINUX_LIB")
-                      ?? "/usr/local/cuda-13.2/lib64";
         Console.WriteLine($"Copying TensorRT runtime from {trtLib} + cudart from {cudaLib}...");
 
         // Versioned runtime libraries (and the unversioned/.11 symlinks) the
@@ -246,7 +298,136 @@ async Task InstallInferenceRuntime()
         var trtexecDst = Path.Combine(inferencePath, "trtexec");
         CopyOrLink(trtexecSrc, trtexecDst);
         await RunProcess("chmod", $"+x \"{trtexecDst}\"");
+
+        if (Directory.Exists(downloadRoot))
+        {
+            Directory.Delete(downloadRoot, true);
+        }
     }
+}
+
+// The Linux counterpart of the TensorRT zip: NVIDIA's apt packages, pulled
+// straight from the CUDA repo pool and unpacked into `root`. No apt, no
+// third-party mirror, and no dependency on the build image carrying TensorRT.
+async Task InstallTrtDebs(string root)
+{
+    Directory.CreateDirectory(root);
+    // libnvinfer11 also carries the per-SM builder resources; libnvinfer-bin is
+    // where trtexec lives. The -dev/-headers-dev packages are build-time only
+    // (animejanai-inference) and deliberately not fetched here.
+    var packages = new[]
+    {
+        "libnvinfer11", "libnvinfer-plugin11", "libnvonnxparsers11", "libnvinfer-bin",
+    };
+
+    foreach (var package in packages)
+    {
+        var deb = $"{package}_{TrtVersion}-1+cuda{TrtCudaVersion}_amd64.deb";
+        var targetPath = Path.GetFullPath(deb);
+
+        Console.WriteLine($"Downloading {package} ({TrtVersion})...");
+        double lastProgress = -1;
+        await DownloadFileAsync($"{CudaAptRepo}/{deb}", targetPath, (progress) =>
+        {
+            if (progress >= lastProgress + 25)
+            {
+                Console.WriteLine($"  {package} ({progress}%)...");
+                lastProgress = progress;
+            }
+        });
+        VerifySha256(targetPath, trtDebSha256[package]);
+
+        await RunProcess("dpkg-deb", $"-x \"{targetPath}\" \"{root}\"");
+        File.Delete(targetPath);
+    }
+
+    // NVIDIA's license text, kept beside the binaries as on Windows.
+    var copyright = Path.Combine(root, "usr", "share", "doc", "libnvinfer11", "copyright");
+    if (File.Exists(copyright))
+    {
+        File.Copy(copyright, Path.Combine(inferencePath, "TensorRT_Acknowledgements.txt"), true);
+    }
+}
+
+// cudart for Linux, from the same CUDA redistributable manifest the Windows
+// side uses. Returns the directory holding libcudart.so*.
+async Task<string> InstallCudartLinux(string root)
+{
+    var stem = $"cuda_cudart-linux-x86_64-{CudartVersion}-archive";
+    var targetPath = Path.GetFullPath($"{stem}.tar.xz");
+
+    Console.WriteLine($"Downloading CUDA runtime {CudartVersion}...");
+    await DownloadFileAsync(
+        $"https://developer.download.nvidia.com/compute/cuda/redist/cuda_cudart/linux-x86_64/{stem}.tar.xz",
+        targetPath, _ => { });
+    VerifySha256(targetPath, CudartSha256Linux);
+
+    Directory.CreateDirectory(root);
+    await RunProcess("tar", $"-xf \"{targetPath}\" -C \"{root}\"");
+    File.Delete(targetPath);
+
+    // Same license the Windows leg keeps, under the same name.
+    var license = Path.Combine(root, stem, "LICENSE");
+    if (File.Exists(license))
+    {
+        File.Copy(license, Path.Combine(inferencePath, "CUDA_LICENSE.txt"), true);
+    }
+
+    return Path.Combine(root, stem, "lib");
+}
+
+// cudart is not part of the TensorRT archive; it comes from NVIDIA's CUDA
+// redistributable, whose manifest publishes a sha256 per file.
+async Task InstallCudart()
+{
+    var stem = $"cuda_cudart-windows-x86_64-{CudartVersion}-archive";
+    var downloadUrl = "https://developer.download.nvidia.com/compute/cuda/redist/" +
+                      $"cuda_cudart/windows-x86_64/{stem}.zip";
+    var targetPath = Path.GetFullPath($"{stem}.zip");
+
+    Console.WriteLine($"Downloading CUDA runtime {CudartVersion}...");
+    await DownloadFileAsync(downloadUrl, targetPath, _ => { });
+    VerifySha256(targetPath, CudartSha256Win);
+
+    ExtractZipFiltered(targetPath, entry =>
+    {
+        var name = Path.GetFileName(entry);
+        // Disambiguate the archive's bare "LICENSE" the way DirectML's is.
+        if (name.Equals("LICENSE", StringComparison.OrdinalIgnoreCase))
+            return Path.Combine(inferencePath, "CUDA_LICENSE.txt");
+        return KeepInferenceFile(name) ? Path.Combine(inferencePath, name) : null;
+    });
+
+    File.Delete(targetPath);
+}
+
+// The package's statement of which inference-runtime files actually ship.
+bool KeepInferenceFile(string name) =>
+    plat.InferenceRuntimeFiles.Contains(name) ||
+    plat.InferenceRuntimePrefixes.Any(p => name.StartsWith(p, StringComparison.OrdinalIgnoreCase)) ||
+    name.Contains("LICENSE", StringComparison.OrdinalIgnoreCase);
+
+// NVIDIA publishes no checksum beside the TensorRT zip, so the expected hash is
+// recorded in the pins above from a verified download and enforced on every
+// build afterwards. Catches a truncated download or a swapped archive; the CUDA
+// redistributable's hash does come from NVIDIA's manifest.
+void VerifySha256(string path, string expected)
+{
+    if (string.IsNullOrEmpty(expected))
+    {
+        Console.WriteLine($"  (no sha256 pinned for {Path.GetFileName(path)}, skipping verification)");
+        return;
+    }
+    using var stream = File.OpenRead(path);
+    var actual = Convert.ToHexString(SHA256.HashData(stream));
+    if (!actual.Equals(expected, StringComparison.OrdinalIgnoreCase))
+    {
+        throw new InvalidOperationException(
+            $"SHA-256 mismatch for {Path.GetFileName(path)}{Environment.NewLine}" +
+            $"  expected {expected}{Environment.NewLine}" +
+            $"  actual   {actual.ToLowerInvariant()}");
+    }
+    Console.WriteLine($"  sha256 verified: {Path.GetFileName(path)}");
 }
 
 async Task InstallAji()
@@ -420,6 +601,41 @@ async Task InstallCustomLibmpv()
         );
     }
     Directory.Delete(targetExtractPath, true);
+    File.Delete(targetPath);
+}
+
+// Windows standalone player: mpv.exe from the SAME fork build as the libmpv
+// above (mpv-winbuild's player archive vs. its dev archive). This mpv.exe is
+// fully self-contained - statically linked, no libmpv-2.dll dependency - and
+// carries the vf_animejanai filter, so users who prefer plain mpv.exe over
+// mpv.net can launch it directly. Placed next to portable_config/ at the
+// install root, it auto-detects that config dir and runs the same managed
+// profiles/scripts/upscaling as mpvnet.exe. Shipped alongside mpv.net, not
+// instead of it (mpvnet.exe stays the default launcher in manifest.json).
+async Task InstallCustomMpvExe()
+{
+    Console.WriteLine("Downloading custom mpv.exe fork...");
+    var downloadUrl = $"https://github.com/the-database/mpv-winbuild/releases/download/{MpvForkVersion}/mpv-x86_64-{MpvForkBuildDate}-git-{MpvForkGitHash}.7z";
+    var targetPath = Path.GetFullPath("mpv-player.7z");
+    await Downloader.DownloadFileAsync(downloadUrl, targetPath, (progress) =>
+    {
+        Console.WriteLine($"Downloading custom mpv.exe fork ({progress}%)...");
+    });
+
+    Console.WriteLine("Extracting custom mpv.exe fork...");
+    // Just the player entry points: mpv.exe (GUI) + mpv.com (console wrapper).
+    // Skip the archive's docs, updater.bat and file-association scripts.
+    var want = new[] { "mpv.exe", "mpv.com" };
+    using (ArchiveFile archiveFile = new(targetPath))
+    {
+        foreach (var entry in archiveFile.Entries)
+        {
+            if (want.Contains(entry.FileName, StringComparer.OrdinalIgnoreCase))
+            {
+                entry.Extract(Path.Combine(installDirectory, entry.FileName));
+            }
+        }
+    }
     File.Delete(targetPath);
 }
 
@@ -618,12 +834,13 @@ void WriteThirdPartyNotices()
         : "libnvinfer.so.11, libnvinfer_plugin.so.11, libnvonnxparser.so.11, " +
           "libnvinfer_builder_resource_*.so, trtexec) and NVIDIA CUDA runtime " +
           "(libcudart.so.13)";
+    var trtAck = "NVIDIA's own acknowledgements accompany them as\n" +
+                 "        TensorRT_Acknowledgements.txt.";
     var trtSource = plat.IsWindows
-        ? "These files are obtained from the vs-mlrt project's release archives\n" +
-          "        (https://github.com/AmusementClub/vs-mlrt), which redistributes them\n" +
-          "        under the same terms."
+        ? "These files are obtained from NVIDIA's redistributable TensorRT and CUDA\n" +
+          "        downloads, redistributed under the same terms. " + trtAck
         : "These files are obtained from NVIDIA's TensorRT and CUDA Linux packages,\n" +
-          "        redistributed under the same terms.";
+          "        redistributed under the same terms. " + trtAck;
     var ajiNames = plat.IsWindows
         ? "aji.dll / aji_trt.dll / aji_dml.dll / aji_harness.exe / aji_kernel_test.exe"
         : "libaji.so / libaji_trt.so / aji_harness / aji_kernel_test";
@@ -700,7 +917,7 @@ void WriteVersionAndManifest()
             mpvnet = plat.IsWindows ? MpvNetVersion : (string?)null,
             mpvfork = plat.IsWindows ? $"{MpvForkVersion}-{MpvForkGitHash}"
                                      : $"{MpvForkLinuxVersion}",
-            inference_runtime = plat.IsWindows ? VsMlrtCudaVersion : $"trt-{AjiVersion}",
+            inference_runtime = $"trt-{TrtVersion}",
             ort_dml = plat.IsWindows ? $"{OrtDmlVersion}+{DirectMLVersion}" : (string?)null,
             sevenzip = SevenZipVersion,
             rife = RifeModelsVersion,
@@ -741,6 +958,41 @@ void CopyOrLink(string src, string dst)
         File.CreateSymbolicLink(dst, Path.GetFileName(info.LinkTarget));
     else
         File.Copy(src, dst, true);
+}
+
+// Selective ExtractZip: mapEntry returns the destination path for an entry, or
+// null to skip it. Used for the TensorRT and CUDA archives, where only a
+// handful of files out of ~2.5 GB are wanted, so extracting wholesale and then
+// filtering would write (and delete) gigabytes for nothing.
+void ExtractZipFiltered(string archivePath, Func<string, string?> mapEntry)
+{
+    using var fsInput = File.OpenRead(archivePath);
+    using var zf = new ZipFile(fsInput);
+
+    var buffer = new byte[81920];
+    foreach (ZipEntry zipEntry in zf)
+    {
+        if (!zipEntry.IsFile)
+        {
+            continue;
+        }
+        var destination = mapEntry(zipEntry.Name);
+        if (destination == null)
+        {
+            continue;
+        }
+
+        var directoryName = Path.GetDirectoryName(destination);
+        if (directoryName?.Length > 0)
+        {
+            Directory.CreateDirectory(directoryName);
+        }
+
+        Console.WriteLine($"  {Path.GetFileName(destination)}");
+        using var zipStream = zf.GetInputStream(zipEntry);
+        using Stream fsOutput = File.Create(destination);
+        StreamUtils.Copy(zipStream, fsOutput, buffer);
+    }
 }
 
 void ExtractZip(string archivePath, string outFolder, ProgressChanged progressChanged)
@@ -857,6 +1109,7 @@ async Task Main()
     {
         await InstallMpvnet();
         await InstallCustomLibmpv();
+        await InstallCustomMpvExe();
     }
     else
     {
@@ -1353,12 +1606,23 @@ async Task<List<string>> EmitComponentPacks()
                     .Select(x => Path.GetRelativePath(installDirectory, x))
                 : new[] { f };
         }).Select(f => f.Replace('\\', '/')).ToArray();
+        // installed_bytes: what this pack occupies once extracted. The updater compares it against
+        // the files actually on disk to decide whether an install is genuinely current, instead of
+        // trusting components.json alone - a record can claim a component is up to date while the
+        // previous release's files are still there (that is how a TensorRT 11.0 runtime survived an
+        // upgrade to a package built for 11.1). Measured before SlimInstallTree removes them.
+        long installedBytes = allFiles.Sum(f =>
+        {
+            var fi = new FileInfo(Path.Combine(installDirectory, f));
+            return fi.Exists ? fi.Length : 0L;
+        });
         index.Add(new
         {
             name,
             dep,
             asset = Path.GetFileName(archive),
             bytes = new FileInfo(archive).Length,
+            installed_bytes = installedBytes,
             files = allFiles,
         });
         packedFiles.AddRange(allFiles);
