@@ -64,6 +64,15 @@ local function read_conf()
     return backend, rife, default_slot, sub_render_mode
 end
 
+-- Engine backend library file name on this OS (the dispatcher loads lib<stem>.so on
+-- Linux, lib<stem>.dylib on macOS, <stem>.dll on Windows).
+local function native_lib(stem)
+    local plat = mp.get_property('platform')
+    if plat == 'windows' then return stem .. '.dll' end
+    if plat == 'darwin' then return 'lib' .. stem .. '.dylib' end
+    return 'lib' .. stem .. '.so'
+end
+
 local function exists(rel)
     -- the installed/writable tree (config-dir parent = install root)
     if utils.file_info(mp.command_native({'expand-path', '~~/../' .. rel})) ~= nil then
@@ -117,7 +126,7 @@ local function check_components(backend, rife_configured)
         -- The ROCm/MIGraphX backend needs its shim (libaji_rocm) next to the
         -- dispatcher and a system ROCm install (MIGraphX/HIP). MIGraphX compiles a
         -- per-resolution engine on first use (a few seconds), then caches a .mxr.
-        if not exists('animejanai/inference/libaji_rocm.so') then
+        if not exists('animejanai/inference/' .. native_lib('aji_rocm')) then
             hints[#hints + 1] =
                 'ROCm backend (libaji_rocm) not installed - press Ctrl+E to open ' ..
                 'AnimeJaNai Manager'
@@ -125,7 +134,7 @@ local function check_components(backend, rife_configured)
     elseif backend == 'vulkan' or backend == 'ncnn' then
         -- The ncnn-Vulkan backend (libaji_vk) needs only a system Vulkan driver
         -- (mesa/RADV, nvidia, anv) - no ROCm or CUDA. The shim ships in-package.
-        if not exists('animejanai/inference/libaji_vk.so') then
+        if not exists('animejanai/inference/' .. native_lib('aji_vk')) then
             hints[#hints + 1] =
                 'Vulkan backend (libaji_vk) not installed - press Ctrl+E to open ' ..
                 'AnimeJaNai Manager'
