@@ -64,6 +64,15 @@ local function read_conf()
     return backend, rife, default_slot, sub_render_mode
 end
 
+-- Engine backend library file name on this OS (the dispatcher loads lib<stem>.so on
+-- Linux, lib<stem>.dylib on macOS, <stem>.dll on Windows).
+local function native_lib(stem)
+    local plat = mp.get_property('platform')
+    if plat == 'windows' then return stem .. '.dll' end
+    if plat == 'darwin' then return 'lib' .. stem .. '.dylib' end
+    return 'lib' .. stem .. '.so'
+end
+
 local function exists(rel)
     -- the installed/writable tree (config-dir parent = install root)
     if utils.file_info(mp.command_native({'expand-path', '~~/../' .. rel})) ~= nil then
@@ -113,6 +122,23 @@ local function check_components(backend, rife_configured)
                     'will fail; press Ctrl+E to open AnimeJaNai Manager'
             end
         end
+    elseif backend == 'rocm' then
+        -- The ROCm/MIGraphX backend needs its shim (libaji_rocm) next to the
+        -- dispatcher and a system ROCm install (MIGraphX/HIP). MIGraphX compiles a
+        -- per-resolution engine on first use (a few seconds), then caches a .mxr.
+        if not exists('animejanai/inference/' .. native_lib('aji_rocm')) then
+            hints[#hints + 1] =
+                'ROCm backend (libaji_rocm) not installed - press Ctrl+E to open ' ..
+                'AnimeJaNai Manager'
+        end
+    elseif backend == 'vulkan' or backend == 'ncnn' then
+        -- The ncnn-Vulkan backend (libaji_vk) needs only a system Vulkan driver
+        -- (mesa/RADV, nvidia, anv) - no ROCm or CUDA. The shim ships in-package.
+        if not exists('animejanai/inference/' .. native_lib('aji_vk')) then
+            hints[#hints + 1] =
+                'Vulkan backend (libaji_vk) not installed - press Ctrl+E to open ' ..
+                'AnimeJaNai Manager'
+        end
     end
     if rife_configured then
         local rdir = mp.command_native({'expand-path', '~~/../animejanai/rife'})
@@ -159,17 +185,41 @@ end
 local backend_raw, rife_configured, default_slot, sub_render_mode = read_conf()
 local backend = (backend_raw or 'TensorRT'):lower()
 local hwdec = 'nvdec'
+local extra = ''
 -- DirectML/ncnn use D3D11 frames (hwdec=d3d11va, gpu-api=d3d11). Windows-only:
--- there is no D3D11 on Linux, where only the TensorRT (CUDA/nvdec) backend
--- exists, so this branch is guarded behind the platform.
+-- there is no D3D11 on Linux; the Linux backends (rocm, vulkan/ncnn-Vulkan)
+-- are handled below.
 if (backend == 'directml' or backend == 'ncnn')
         and mp.get_property('platform') == 'windows' then
     hwdec = 'd3d11va'
     mp.set_property('gpu-api', 'd3d11')
+    extra = ', gpu-api=d3d11'
+elseif backend == 'rocm' then
+    -- AMD ROCm/MIGraphX backend (Linux/AMD). The filter's software path takes host
+    -- NV12/P010, the shim runs the model on the GPU via MIGraphX, decode stays
+    -- software (mpv autoconverts to NV12), the VO renders via gpu-next/libplacebo.
+    hwdec = 'no'
+    extra = ' (software-fed; MIGraphX inference on the GPU)'
+elseif backend == 'vulkan' or backend == 'ncnn' then
+    -- ncnn-Vulkan backend (portable: AMD/NVIDIA/Intel, any Vulkan driver). Same
+    -- software-fed path as ROCm: host NV12/P010 in, the shim runs the model on the
+    -- GPU via ncnn-Vulkan, decode stays software, VO renders via gpu-next/libplacebo.
+    hwdec = 'no'
+    extra = ' (software-fed; ncnn-Vulkan inference on the GPU)'
 end
 mp.set_property('hwdec', hwdec)
-msg.info(string.format('backend %s -> hwdec=%s%s', backend, hwdec,
-                       hwdec == 'd3d11va' and ', gpu-api=d3d11' or ''))
+msg.info(string.format('backend %s -> hwdec=%s%s', backend, hwdec, extra))
+
+-- Launch the Manager. The input.conf binding uses `run "~~/.."`, but mpv's run
+-- command does NOT expand ~~/ paths, so it fails on a relocated/portable install.
+-- Handle it here with the expanded absolute path (works wherever the package sits).
+mp.register_script_message('animejanai-launch-manager', function()
+    local mgr = mp.command_native({'expand-path', '~~/../AnimeJaNaiManager'})
+    -- Windows ships AnimeJaNaiManager.exe; Linux ships an extensionless binary.
+    if utils.file_info(mgr .. '.exe') then mgr = mgr .. '.exe' end
+    mp.osd_message('Launching AnimeJaNai Manager...')
+    utils.subprocess_detached({args = {mgr}})
+end)
 
 -- Opt-in GPU subtitle rendering: only ever applied on top of the stable
 -- defaults, never the reverse, so a user who set any of these options in

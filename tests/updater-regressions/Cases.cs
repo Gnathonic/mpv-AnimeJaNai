@@ -103,6 +103,18 @@ try
         Pass("local-pack-control");
     }
     {
+        // Linux packs are emitted RID-suffixed (packs-linux-x64.json + component-*-linux-x64.7z);
+        // a local packs dir must resolve that name before the Windows packs.json.
+        var http = new FixtureHttp(); string packs = Path.Combine(root, "local-packs-linux"); Directory.CreateDirectory(packs);
+        File.WriteAllText(Path.Combine(packs, "packs-linux-x64.json"), FixtureHttp.Index("3.6.0"));
+        File.WriteAllText(Path.Combine(packs, "packs.json"), FixtureHttp.Index("3.5.0"));
+        Environment.SetEnvironmentVariable("ANIMEJANAI_PACKS_DIR", packs);
+        var index = await new Production(root, http, false).Packs();
+        Environment.SetEnvironmentVariable("ANIMEJANAI_PACKS_DIR", null);
+        Check(index.PackageVersion == "3.6.0" && http.Urls.Count == 0, "Linux local pack override did not prefer the RID-suffixed index");
+        Pass("linux-local-pack-control");
+    }
+    {
         var http = new FixtureHttp();
         string dir = Path.Combine(root, "pinned-components"); Directory.CreateDirectory(dir);
         File.WriteAllText(Path.Combine(dir, "version.txt"), "3.6.1-test.1");

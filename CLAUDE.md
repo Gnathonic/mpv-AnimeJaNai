@@ -66,8 +66,10 @@ at the bottom of `Program.cs`.
 
 Windows-only pieces (no Linux equivalent installed): mpv.net, and the DirectML backend
 (`aji_dml.dll`, ONNX Runtime DirectML, `DirectML.dll` — `HasDirectML = false` on Linux).
-Linux gets its mpv bundle from a `the-database/mpv` release; both platforms fetch the
-TensorRT runtime straight from NVIDIA (the Windows zip, the Linux `.deb`s).
+Linux gets its mpv bundle from a `the-database/mpv` release and, since stock mpv has no
+mpv.net UI, ships uosc (`portable_config/scripts/uosc`) as the control bar + context menu,
+with the mpv.net keybindings ported to it; both platforms fetch the TensorRT runtime straight
+from NVIDIA (the Windows zip, the Linux `.deb`s).
 
 When adding or changing build/runtime tooling, keep it portable:
 
@@ -78,9 +80,15 @@ When adding or changing build/runtime tooling, keep it portable:
 - Drive platform-specific names/paths (player executable, archive tool, exe suffix, etc.) from data
   like `manifest.json` rather than hardcoding `mpvnet.exe` / `7z.exe` / `.exe`. The updater
   (`AnimeJaNaiUpdater/`) already does this as the reference pattern.
-- A new component must land on both legs. `PortConfigsForTarget()` rewrites the config paths
-  for Linux (`aji.dll`→`libaji.so`, `trtexec.exe`→`trtexec`, `'Segoe UI'`→`'sans-serif'`); add
-  to it rather than forking the config files.
+- A new component must land on both legs. `PortConfigsForTarget()` is the one place the
+  configs get ported for a non-Windows target: it rewrites the platform literals
+  (`aji.dll`→`libaji.so`, `trtexec.exe`→`trtexec`, `'Segoe UI'`→`'sans-serif'`), turns off the
+  built-in OSC/OSD bar, ports the mpv.net-only keybindings in `input-animejanai.conf` to stock
+  mpv + uosc (`PortInputConfForStockMpv`, a pure text→text helper that drops whatever has no
+  stock-mpv equivalent) and bundles uosc (`InstallUosc`, pinned by `UoscVersion` +
+  `UoscSha256`). It is a no-op on Windows and idempotent. Add to it rather than forking the
+  config files, and never add a Linux-only rewrite anywhere else (the local `--local-dev`
+  assembly reuses it and layers only its AMD-backend deltas on top).
 
 ## Building and releasing
 
